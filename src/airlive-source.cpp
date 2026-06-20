@@ -157,27 +157,6 @@ std::string loadOrCreateDid() {
     return did.empty() ? genUuid() : did;
 }
 
-// Monotonic per-install counter for default source labels ("OBS Source N"),
-// persisted next to the install id. Returns the index to use, then bumps it.
-int nextSourceIndex() {
-    int n = 1;
-    char *path = obs_module_config_path("source-counter.txt");
-    if (path) {
-        if (os_file_exists(path)) {
-            if (char *c = os_quick_read_utf8_file(path)) {
-                const int parsed = atoi(c);
-                if (parsed >= 1)
-                    n = parsed;
-                bfree(c);
-            }
-        }
-        const std::string next = std::to_string(n + 1);
-        os_quick_write_utf8_file(path, next.c_str(), next.size(), false);
-        bfree(path);
-    }
-    return n;
-}
-
 // ---- AVFrame -> obs_source_frame2 -----------------------------------------
 // Color helpers mirror OBS's own FFmpeg decoder
 // (plugins/win-dshow/ffmpeg-decode.c) so behaviour matches every other OBS
@@ -342,32 +321,39 @@ void onDecodedFrame(AirliveSourceCtx *ctx, const AVFrame *f, int64_t pts_us) {
 
 // ---- tally (Studio Mode -> setCue) ----------------------------------------
 
-const char *computeCue(AirliveSourceCtx *ctx) {
-    if (obs_source_active(ctx->source))
-        return "program";              // on air
-    if (obs_source_showing(ctx->source))
-        return "preview";              // staged in Studio Mode preview
-    return "none";
-}
-
 // Send the current cue to the iPhone. force=true sends even if unchanged (used
 // when the phone (re)connects, so it learns it's already live).
+//
+// active → "program" (on air); else showing → "preview" (staged in Studio Mode);
+// else "none". The cue is a closed set of literals, so building the JSON by
+// concatenation is safe — no escaping needed.
 void ensureTally(AirliveSourceCtx *ctx, bool force) {
     if (!ctx->conn)
         return;
-    const std::string cue = computeCue(ctx);
-    bool changed = false;
+    const bool active = obs_source_active(ctx->source);
+    const bool showing = obs_source_showing(ctx->source);
+    const char *cue = active ? "program" : (showing ? "preview" : "none");
+
+    bool valueChanged, needSend;
     {
         std::lock_guard<std::mutex> lk(ctx->tallyMutex);
-        if (force || cue != ctx->lastCue) {
-            ctx->lastCue = cue;
-            changed = true;
-        }
+        valueChanged = (cue != ctx->lastCue);
+        needSend = force || valueChanged; // force re-asserts on (re)connect
     }
-    if (changed)
-        // cue is a closed set of literals ("program"/"preview"/"none"), so
-        // building the JSON by concatenation is safe — no escaping needed.
-        ctx->conn->sendControl(std::string("{\"type\":\"setCue\",\"stringValue\":\"") + cue + "\"}");
+    if (!needSend)
+        return;
+
+    const bool ok = ctx->conn->sendControl(
+        std::string("{\"type\":\"setCue\",\"stringValue\":\"") + cue + "\"}");
+    if (ok) {
+        // Commit lastCue ONLY after a confirmed send — a dropped cue stays
+        // "unsent" so the next evaluation retries it (no optimistic dedup).
+        std::lock_guard<std::mutex> lk(ctx->tallyMutex);
+        ctx->lastCue = cue;
+    }
+    // Log only real transitions / drops — never the ~1 Hz force re-asserts.
+    if (valueChanged || !ok)
+        blog(LOG_INFO, "[airlive] tally -> %s%s", cue, ok ? "" : " (DROPPED, will retry)");
 }
 
 // ---- control channel (status) ---------------------------------------------
@@ -433,12 +419,15 @@ const char *source_get_name(void *) {
 void apply_settings(AirliveSourceCtx *ctx, obs_data_t *settings) {
     ctx->dev = obs_data_get_string(settings, kSettingDeviceName);
 
-    // src has no static default — a brand-new source gets an incrementing
-    // "OBS Source N" written into its settings (so it persists with the scene);
-    // a saved/renamed source keeps whatever is stored.
+    // The iPhone-facing label defaults to the OBS source's OWN name — the unique
+    // name the operator typed when adding it (and can rename in the Sources
+    // list). Saved once so it persists; the operator can still override it in
+    // this source's properties. No counter (that produced ever-growing numbers
+    // unrelated to how many sources actually exist).
     ctx->src = obs_data_get_string(settings, kSettingSourceName);
     if (ctx->src.empty()) {
-        ctx->src = "OBS Source " + std::to_string(nextSourceIndex());
+        const char *sname = obs_source_get_name(ctx->source);
+        ctx->src = (sname && *sname) ? sname : "OBS Source";
         obs_data_set_string(settings, kSettingSourceName, ctx->src.c_str());
     }
 

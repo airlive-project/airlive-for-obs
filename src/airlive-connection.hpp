@@ -48,8 +48,9 @@ public:
     bool connected() const { return connected_.load(); }
 
     // Send a control message (type-2) back to the iPhone over the same socket.
-    // Thread-safe; a no-op when no iPhone is connected. Used for tally (setCue).
-    void sendControl(const std::string &json);
+    // Thread-safe. Returns true only if the whole packet was written; false if
+    // no iPhone is connected or the send was dropped (so the caller can retry).
+    bool sendControl(const std::string &json);
 
 private:
     void run();                        // thread body

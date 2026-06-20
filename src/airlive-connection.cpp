@@ -243,7 +243,7 @@ void AirliveConnection::serveClient(socket_t client) {
     }
 }
 
-void AirliveConnection::sendControl(const std::string &json) {
+bool AirliveConnection::sendControl(const std::string &json) {
     // Frame a type-2 packet: 18-byte header (big-endian) + JSON payload.
     std::vector<uint8_t> out;
     out.reserve(kHeaderSize + json.size());
@@ -271,7 +271,7 @@ void AirliveConnection::sendControl(const std::string &json) {
 
     std::lock_guard<std::mutex> lk(sendMutex_);
     if (clientFd_ == kInvalidSocket)
-        return; // nobody connected — drop silently
+        return false; // nobody connected — drop silently
 
     // The client socket is NON-BLOCKING (set in serveClient), and we run on the
     // OBS UI thread under sendMutex_. So we must neither spin forever NOR bail
@@ -301,15 +301,16 @@ void AirliveConnection::sendControl(const std::string &json) {
             (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR));
 #endif
         if (!wouldBlock || spentMs >= kSendBudgetMs)
-            return; // real error, or budget spent — peer gone/wedged; read loop reaps it
+            return false; // real error, or budget spent — peer gone/wedged; read loop reaps it
         poll_fd_t pfd{};
         pfd.fd = clientFd_;
         pfd.events = POLLOUT;
         constexpr int kSliceMs = 50;
         if (poll_sockets(&pfd, 1, kSliceMs) < 0)
-            return;
+            return false;
         spentMs += kSliceMs;
     }
+    return true; // whole packet written
 }
 
 } // namespace airlive
