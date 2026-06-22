@@ -21,7 +21,7 @@ namespace airlive {
 
 struct ServiceIdentity {
     std::string did; // stable per-install UUID — group key
-    std::string dev; // group display name, default "Airlive OBS"
+    std::string dev; // group display name, default "OBS Airlive"
     std::string sid; // stable per-source id
     std::string src; // source display name, default "OBS Source N"
 };

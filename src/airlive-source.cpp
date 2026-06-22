@@ -1,4 +1,4 @@
-// airlive-source.cpp — the OBS source "Airlive OBS".
+// airlive-source.cpp — the OBS source "OBS Airlive".
 //
 // One source == one advertised Bonjour instance == one iPhone slot. This file
 // owns the OBS-facing surface: registration, properties, the AVFrame ->
@@ -727,7 +727,7 @@ void source_update(void *data, obs_data_t *settings) {
 }
 
 void source_get_defaults(obs_data_t *settings) {
-    obs_data_set_default_string(settings, kSettingDeviceName, "Airlive OBS");
+    obs_data_set_default_string(settings, kSettingDeviceName, "OBS Airlive");
     // No default for source_name — apply_settings adopts the OBS source name once.
     obs_data_set_default_int(settings, kSettingDelayMs, kDefaultDelayMs);
     obs_data_set_default_bool(settings, kSettingRequireAuth, false); // open by default
@@ -964,7 +964,7 @@ bool obs_module_load(void) {
     signal(SIGPIPE, SIG_IGN);
 #endif
     obs_register_source(&airlive_source_info);
-    blog(LOG_INFO, "[airlive-obs] Airlive OBS loaded");
+    blog(LOG_INFO, "[airlive-obs] OBS Airlive loaded");
     return true;
 }
 
@@ -972,13 +972,13 @@ void obs_module_unload(void) {
 #ifdef _WIN32
     WSACleanup();
 #endif
-    blog(LOG_INFO, "[airlive-obs] Airlive OBS unloaded");
+    blog(LOG_INFO, "[airlive-obs] OBS Airlive unloaded");
 }
 
 MODULE_EXPORT const char *obs_module_description(void) {
-    return "Airlive OBS — iPhone (Airlive Camera) as an async video source over LAN";
+    return "OBS Airlive — iPhone (Airlive Camera) as an async video source over LAN";
 }
 
 MODULE_EXPORT const char *obs_module_name(void) {
-    return "Airlive OBS";
+    return "OBS Airlive";
 }
