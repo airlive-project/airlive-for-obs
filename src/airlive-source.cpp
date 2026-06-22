@@ -39,6 +39,7 @@ extern "C" {
 }
 
 #include "airlive-connection.hpp"
+#include "secret-store.hpp"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("airlive-obs", "en-US")
@@ -623,17 +624,24 @@ ServiceIdentity makeIdentity(const AirliveSourceCtx *ctx) {
     return ServiceIdentity{ctx->did, ctx->dev, ctx->sid, ctx->src};
 }
 
-// Push the receiver-password auth config to the connection (STREAM-AUTH-SPEC).
+// Push the receiver-password auth config to the connection (STREAM-AUTH-SPEC §4).
 // Auth engages only when the toggle is on AND a password is set; OFF by default.
-// NOTE: the password is stored in OBS settings (scene-collection JSON) — see the
-// caveat by the property below. A change applies to the NEXT connection (the
-// operator re-taps Live on the iPhone to re-authenticate).
+//
+// The password is kept in the OS secret store (macOS Keychain), NEVER in the
+// scene-collection JSON: if the operator typed a new one, we move it into the
+// Keychain (keyed by the stable sid) and SCRUB the settings field so nothing
+// plaintext persists on disk. A blank field means "keep the stored password"
+// (use the Clear button to remove it). A change applies to the NEXT connection.
 void applyAuth(AirliveSourceCtx *ctx, obs_data_t *settings) {
     if (!ctx->conn)
         return;
+    const char *typed = obs_data_get_string(settings, kSettingPassword);
+    if (typed && *typed) {
+        secretStoreSet(ctx->sid, typed);
+        obs_data_set_string(settings, kSettingPassword, ""); // never persist plaintext
+    }
     const bool require = obs_data_get_bool(settings, kSettingRequireAuth);
-    const char *pw = obs_data_get_string(settings, kSettingPassword);
-    ctx->conn->setAuth(require, pw ? pw : "");
+    ctx->conn->setAuth(require, secretStoreGet(ctx->sid));
 }
 
 // (Re)build the connection with the current identity. Called on create and
@@ -775,6 +783,18 @@ std::string buildStatusText(AirliveSourceCtx *ctx) {
         if (ctx->rWB > 0)
             s += "\nWB " + std::to_string(int(ctx->rWB + 0.5)) + "K" + (ctx->rAWB ? " (auto)" : "");
     }
+    // Auth status (independent of connection) — confirms a password is stored,
+    // since the password field blanks itself after saving (it's in the Keychain).
+    {
+        obs_data_t *st = obs_source_get_settings(ctx->source);
+        const bool req = obs_data_get_bool(st, kSettingRequireAuth);
+        obs_data_release(st);
+        const bool hasPw = !secretStoreGet(ctx->sid).empty();
+        if (req && hasPw)
+            s += "\n🔒 Password required";
+        else if (req && !hasPw)
+            s += "\n⚠️ Require password is ON but none set — channel stays OPEN";
+    }
     return s;
 }
 
@@ -794,6 +814,20 @@ bool cam_auto_modified(obs_properties_t *props, obs_property_t *, obs_data_t *se
 
 bool refresh_clicked(obs_properties_t *, obs_property_t *, void *) {
     return true; // returning true rebuilds the property view -> re-reads status
+}
+
+// Delete the stored password from the Keychain and push the now-empty config to
+// the connection (auth effectively off until a new password is set).
+bool clear_password_clicked(obs_properties_t *, obs_property_t *, void *data) {
+    auto *ctx = static_cast<AirliveSourceCtx *>(data);
+    secretStoreDelete(ctx->sid);
+    obs_data_t *s = obs_source_get_settings(ctx->source);
+    obs_data_set_string(s, kSettingPassword, "");
+    const bool require = obs_data_get_bool(s, kSettingRequireAuth);
+    obs_data_release(s);
+    if (ctx->conn)
+        ctx->conn->setAuth(require, ""); // no password → auth disengages
+    return true; // rebuild the view (status reflects the cleared state)
 }
 
 obs_properties_t *source_get_properties(void *data) {
@@ -826,21 +860,21 @@ obs_properties_t *source_get_properties(void *data) {
     obs_properties_add_text(props, kSettingSourceName, obs_module_text("Airlive.SourceLabel"),
                             OBS_TEXT_DEFAULT);
 
-    // ---- Security: receiver-password auth (STREAM-AUTH-SPEC) ----
+    // ---- Security: receiver-password auth (STREAM-AUTH-SPEC §4) ----
     // Off by default — the stream stays open until the operator turns this on AND
     // sets a password. Closes the same-LAN-prankster threat (slot-grab / fake-feed
     // injection); it is ACCESS control, not encryption. The camera answers an HMAC
-    // challenge — the password never crosses the wire.
-    // CAVEAT: the password is stored in OBS's scene-collection settings (the same
-    // place OBS keeps stream keys), i.e. plaintext on disk. TODO: move to the OS
-    // secret store (macOS Keychain / libsecret / DPAPI) per the spec — tracked as
-    // a follow-up; keep passwords ASCII for cross-platform byte-identity.
+    // challenge — the password never crosses the wire. The password is stored in
+    // the macOS Keychain (see applyAuth) — never plaintext in the scene file.
     obs_properties_add_text(props, "sec_hdr", "— Security —", OBS_TEXT_INFO);
     obs_properties_add_bool(props, kSettingRequireAuth, "Require password");
     obs_property_t *pw = obs_properties_add_text(props, kSettingPassword, "Password", OBS_TEXT_PASSWORD);
     obs_property_set_long_description(
-        pw, "Cameras must enter this to connect. Changing it takes effect on the next "
-            "connection (re-tap Live on the iPhone). ASCII only.");
+        pw, "Cameras must enter this to connect. Stored in the macOS Keychain (the field "
+            "blanks after saving). Changing it takes effect on the next connection "
+            "(re-tap Live on the iPhone). ASCII only.");
+    obs_properties_add_button2(props, "clear_password", "Clear stored password",
+                               clear_password_clicked, ctx);
 
     // ---- Camera control (Phase 2a) ----
     // Send-only knobs: changing one ships a set-command to the iPhone. The
