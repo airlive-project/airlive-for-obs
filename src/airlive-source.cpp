@@ -52,6 +52,22 @@ constexpr const char *kSettingSourceName = "source_name";
 constexpr const char *kSettingDelayMs = "delay_ms";
 constexpr const char *kSettingSid = "sid"; // hidden — stable per-source id
 
+// Phase-2a camera-control properties — each maps to a type-2 set-command sent to
+// the iPhone when the operator changes it. SEND-only (live readback goes to the
+// status text, not back into these, to avoid a feedback loop).
+constexpr const char *kCamAE = "cam_ae";
+constexpr const char *kCamISO = "cam_iso";
+constexpr const char *kCamShutter = "cam_shutter";
+constexpr const char *kCamAWB = "cam_awb";
+constexpr const char *kCamWB = "cam_wb";
+constexpr const char *kCamTint = "cam_tint";
+constexpr const char *kCamAF = "cam_af";
+constexpr const char *kCamFocus = "cam_focus";
+constexpr const char *kCamLens = "cam_lens";
+constexpr const char *kCamFPS = "cam_fps";
+constexpr const char *kCamZoom = "cam_zoom";
+constexpr const char *kCamLUT = "cam_lut";
+
 constexpr int kDefaultDelayMs = 120; // Studio-style fixed delay (Normal preset)
 constexpr int kMaxDelayMs = 400;     // matches the highest preset (Safe)
 constexpr size_t kSafetyCapFrames = 600; // anti-runaway if timestamps stop advancing
@@ -90,15 +106,36 @@ struct AirliveSourceCtx {
     int swsW = 0, swsH = 0;
     int swsSrcFmt = -1;
 
+    // Output rotation (clockwise degrees: 0/90/180/270) from the iPhone's
+    // StateSnapshot.outputRotation. Presentation-only: 90/270 swap W/H (portrait).
+    std::atomic<int> rotationDeg{0};
+    std::vector<uint8_t> rotBuf;   // rotated I420 output (worker thread only)
+    std::vector<uint8_t> i420Buf;  // sws→I420 staging for non-420p input
+    SwsContext *swsRot = nullptr;  // converts a non-420p frame to I420 before rotating
+    int swsRotW = 0, swsRotH = 0, swsRotFmt = -1;
+
     // Live stats (from decoded frames). statW/H/Fps are read by get_properties.
     std::atomic<uint32_t> statW{0}, statH{0};
     std::atomic<double> statFps{0.0};
     int64_t lastPtsUs = 0; // fps EMA state — touched only on the worker thread
     double fpsEma = 0.0;
 
-    // Remote camera state (from the iPhone's type-2 JSON snapshot).
+    // Remote camera state (from the iPhone's type-2 JSON snapshot) — for the
+    // read-only status readout.
     std::mutex stateMutex;
     std::string rDevice, rResolution, rColorSpace, rLens;
+    double rIso = 0, rShutter = 0, rWB = 0;
+    int rFps = 0;
+    bool rAE = false, rAWB = false;
+
+    // Camera-control last-sent values: used to (a) detect which control the
+    // operator actually changed in update(), and (b) seed the auto/manual
+    // grey-out state when the properties dialog opens. Touched on the OBS thread.
+    bool ccInit = false;
+    bool cAE = true, cAWB = true, cAF = true, cLUT = false;
+    int cISO = 100, cShutter = 50, cWB = 5600, cTint = 0, cFPS = 30;
+    double cFocus = 0.5, cZoom = 1.0;
+    std::string cLens = "1x";
 
     // Tally state — guarded because OBS fires the callbacks on its own thread.
     std::mutex tallyMutex;
@@ -107,6 +144,8 @@ struct AirliveSourceCtx {
     ~AirliveSourceCtx() {
         if (sws)
             sws_freeContext(sws);
+        if (swsRot)
+            sws_freeContext(swsRot);
     }
 };
 
@@ -197,8 +236,109 @@ uint8_t avframeTRC(const AVFrame *f) {
     }
 }
 
+// ---- output rotation (StateSnapshot.outputRotation, clockwise) -------------
+
+int normalizeRotation(int d) { return (d == 90 || d == 180 || d == 270) ? d : 0; }
+
+// Rotate one 8-bit plane CLOCKWISE into a tightly-packed dst (stride = dst width).
+void rotatePlaneCW(const uint8_t *s, int sw, int sh, int sstride, uint8_t *d, int deg) {
+    if (deg == 180) {
+        for (int y = 0; y < sh; ++y) {
+            const uint8_t *sr = s + size_t(sh - 1 - y) * sstride;
+            uint8_t *dr = d + size_t(y) * sw;
+            for (int x = 0; x < sw; ++x)
+                dr[x] = sr[sw - 1 - x];
+        }
+    } else { // 90 / 270 → dst is sh wide, sw tall
+        const int dw = sh, dh = sw;
+        for (int y = 0; y < dh; ++y) {
+            uint8_t *dr = d + size_t(y) * dw;
+            if (deg == 90)
+                for (int x = 0; x < dw; ++x)
+                    dr[x] = s[size_t(sh - 1 - x) * sstride + y];
+            else // 270
+                for (int x = 0; x < dw; ++x)
+                    dr[x] = s[size_t(x) * sstride + (sw - 1 - y)];
+        }
+    }
+}
+
+// Expose the frame as I420 planes — directly if it already is, else sws-convert
+// once into i420Buf. Keeps rotation a pure pixel reorder (no colour math), so
+// rotated output matches the non-rotated path exactly.
+bool ensureI420(AirliveSourceCtx *ctx, const AVFrame *f, const uint8_t *&y, const uint8_t *&u,
+                const uint8_t *&v, int &ly, int &lu, int &lv) {
+    const int w = f->width, h = f->height, fmt = f->format;
+    if (fmt == AV_PIX_FMT_YUV420P || fmt == AV_PIX_FMT_YUVJ420P) {
+        y = f->data[0]; u = f->data[1]; v = f->data[2];
+        ly = f->linesize[0]; lu = f->linesize[1]; lv = f->linesize[2];
+        return true;
+    }
+    const int cw = (w + 1) / 2, ch = (h + 1) / 2;
+    if (!ctx->swsRot || ctx->swsRotW != w || ctx->swsRotH != h || ctx->swsRotFmt != fmt) {
+        if (ctx->swsRot)
+            sws_freeContext(ctx->swsRot);
+        ctx->swsRot = sws_getContext(w, h, AVPixelFormat(fmt), w, h, AV_PIX_FMT_YUV420P,
+                                     SWS_BILINEAR, nullptr, nullptr, nullptr);
+        ctx->swsRotW = w; ctx->swsRotH = h; ctx->swsRotFmt = fmt;
+        ctx->i420Buf.resize(size_t(w) * h + 2 * size_t(cw) * ch);
+    }
+    if (!ctx->swsRot)
+        return false;
+    uint8_t *dy = ctx->i420Buf.data();
+    uint8_t *du = dy + size_t(w) * h;
+    uint8_t *dv = du + size_t(cw) * ch;
+    uint8_t *dst[3] = {dy, du, dv};
+    int dstStride[3] = {w, cw, cw};
+    sws_scale(ctx->swsRot, f->data, f->linesize, 0, h, dst, dstStride);
+    y = dy; u = du; v = dv; ly = w; lu = cw; lv = cw;
+    return true;
+}
+
+void outputRotated(AirliveSourceCtx *ctx, const AVFrame *f, int64_t pts_us, int rot) {
+    const uint8_t *sy, *su, *sv;
+    int ly, lu, lv;
+    if (!ensureI420(ctx, f, sy, su, sv, ly, lu, lv))
+        return;
+    const int w = f->width, h = f->height, cw = (w + 1) / 2, ch = (h + 1) / 2;
+    const int outW = (rot == 180) ? w : h; // 90/270 swap to portrait
+    const int outH = (rot == 180) ? h : w;
+    const int ocw = (outW + 1) / 2, och = (outH + 1) / 2;
+    const size_t ySize = size_t(outW) * outH, cSize = size_t(ocw) * och;
+    ctx->rotBuf.resize(ySize + 2 * cSize);
+    uint8_t *dy = ctx->rotBuf.data();
+    uint8_t *du = dy + ySize;
+    uint8_t *dv = du + cSize;
+    rotatePlaneCW(sy, w, h, ly, dy, rot);
+    rotatePlaneCW(su, cw, ch, lu, du, rot);
+    rotatePlaneCW(sv, cw, ch, lv, dv, rot);
+
+    obs_source_frame2 frame = {};
+    frame.width = uint32_t(outW);
+    frame.height = uint32_t(outH);
+    frame.timestamp = uint64_t(pts_us) * 1000ull;
+    frame.format = VIDEO_FORMAT_I420;
+    frame.data[0] = dy; frame.linesize[0] = uint32_t(outW);
+    frame.data[1] = du; frame.linesize[1] = uint32_t(ocw); // chroma stride = chroma width
+    frame.data[2] = dv; frame.linesize[2] = uint32_t(ocw);
+
+    const bool isJpeg = (f->format == AV_PIX_FMT_YUVJ420P);
+    const enum video_range_type range =
+        (f->color_range == AVCOL_RANGE_JPEG || isJpeg) ? VIDEO_RANGE_FULL : VIDEO_RANGE_PARTIAL;
+    const enum video_colorspace cs = avframeColorspace(f);
+    frame.range = range;
+    frame.trc = avframeTRC(f);
+    video_format_get_parameters_for_format(cs, range, frame.format, frame.color_matrix,
+                                           frame.color_range_min, frame.color_range_max);
+    obs_source_output_video2(ctx->source, &frame);
+}
+
 // Map a decoded AVFrame and hand it to OBS. Runs on the worker thread only.
 void outputFrame(AirliveSourceCtx *ctx, const AVFrame *f, int64_t pts_us) {
+    if (const int rot = normalizeRotation(ctx->rotationDeg.load())) {
+        outputRotated(ctx, f, pts_us, rot); // clockwise presentation rotation (matches Studio)
+        return;
+    }
     // frame2 (not the legacy frame) — the v1 obs_source_output_video path does
     // not honour partial range, and H.264 is limited-range. See obs.h:1413.
     obs_source_frame2 frame = {};
@@ -285,8 +425,12 @@ bool isTimestampJump(int64_t ts, int64_t prev) {
 // (The previous wall-clock hold added no visible latency: OBS plays async frames
 //  by their timestamp cadence, so a constant per-frame hold is invisible on air.)
 void onDecodedFrame(AirliveSourceCtx *ctx, const AVFrame *f, int64_t pts_us) {
-    ctx->statW.store(uint32_t(f->width));
-    ctx->statH.store(uint32_t(f->height));
+    // Report the OUTPUT dimensions (swapped for 90/270) so OBS sizes the source
+    // to the rotated, portrait frame.
+    const int rot = normalizeRotation(ctx->rotationDeg.load());
+    const bool portrait = (rot == 90 || rot == 270);
+    ctx->statW.store(uint32_t(portrait ? f->height : f->width));
+    ctx->statH.store(uint32_t(portrait ? f->width : f->height));
     if (ctx->lastPtsUs != 0 && pts_us > ctx->lastPtsUs) {
         const double inst = 1e6 / double(pts_us - ctx->lastPtsUs);
         ctx->fpsEma = (ctx->fpsEma == 0.0) ? inst : (ctx->fpsEma * 0.9 + inst * 0.1);
@@ -374,7 +518,15 @@ void onControl(AirliveSourceCtx *ctx, const char *json, size_t len) {
             ctx->rResolution = obs_data_get_string(st, "resolution");
             ctx->rColorSpace = obs_data_get_string(st, "colorSpace");
             ctx->rLens = obs_data_get_string(st, "lens");
+            ctx->rIso = obs_data_get_double(st, "iso");
+            ctx->rShutter = obs_data_get_double(st, "shutterDenom");
+            ctx->rWB = obs_data_get_double(st, "wbKelvin");
+            ctx->rFps = int(obs_data_get_int(st, "fps"));
+            ctx->rAE = obs_data_get_bool(st, "exposureAuto");
+            ctx->rAWB = obs_data_get_bool(st, "whiteBalanceAuto");
         }
+        // Additive presentation rotation (clockwise; absent/0 = landscape).
+        ctx->rotationDeg.store(normalizeRotation(int(obs_data_get_int(st, "outputRotation"))));
         obs_data_release(st);
         gotState = true;
     }
@@ -385,6 +537,81 @@ void onControl(AirliveSourceCtx *ctx, const char *json, size_t len) {
     // redundant setCue for messages that aren't a connect/state event.
     if (gotState)
         ensureTally(ctx, /*force=*/true);
+}
+
+// ---- camera control (Phase 2a — send set-commands) ------------------------
+
+// Each command is a tiny type-2 JSON ControlMessage. We build it with obs_data
+// (correct escaping + number formatting, same lib we parse with) and ship it
+// over the existing control channel. Field names match the iPhone's Codable
+// ControlMessage (floatValue/intValue/stringValue/boolValue/lutName).
+void sendCmd(AirliveSourceCtx *ctx, obs_data_t *d) {
+    if (ctx->conn)
+        ctx->conn->sendControl(obs_data_get_json(d));
+    obs_data_release(d);
+}
+void sendCmdFloat(AirliveSourceCtx *ctx, const char *type, double v) {
+    obs_data_t *d = obs_data_create();
+    obs_data_set_string(d, "type", type);
+    obs_data_set_double(d, "floatValue", v);
+    sendCmd(ctx, d);
+}
+void sendCmdInt(AirliveSourceCtx *ctx, const char *type, int v) {
+    obs_data_t *d = obs_data_create();
+    obs_data_set_string(d, "type", type);
+    obs_data_set_int(d, "intValue", v);
+    sendCmd(ctx, d);
+}
+void sendCmdBool(AirliveSourceCtx *ctx, const char *type, bool v) {
+    obs_data_t *d = obs_data_create();
+    obs_data_set_string(d, "type", type);
+    obs_data_set_bool(d, "boolValue", v);
+    sendCmd(ctx, d);
+}
+void sendCmdString(AirliveSourceCtx *ctx, const char *type, const char *v) {
+    obs_data_t *d = obs_data_create();
+    obs_data_set_string(d, "type", type);
+    obs_data_set_string(d, "stringValue", v);
+    sendCmd(ctx, d);
+}
+
+// Read the control values from settings. When sendDiffs is true, send a command
+// for each one the operator actually changed since last time; always update the
+// cached "last value". On create we call with sendDiffs=false so loading a saved
+// scene doesn't blast the camera with its persisted settings.
+void applyCameraControls(AirliveSourceCtx *ctx, obs_data_t *settings, bool sendDiffs) {
+    const bool ae = obs_data_get_bool(settings, kCamAE);
+    const int iso = int(obs_data_get_int(settings, kCamISO));
+    const int sh = int(obs_data_get_int(settings, kCamShutter));
+    const bool awb = obs_data_get_bool(settings, kCamAWB);
+    const int wb = int(obs_data_get_int(settings, kCamWB));
+    const int tint = int(obs_data_get_int(settings, kCamTint));
+    const bool af = obs_data_get_bool(settings, kCamAF);
+    const double focus = obs_data_get_double(settings, kCamFocus);
+    const std::string lens = obs_data_get_string(settings, kCamLens);
+    const int fps = int(obs_data_get_int(settings, kCamFPS));
+    const double zoom = obs_data_get_double(settings, kCamZoom);
+    const bool lut = obs_data_get_bool(settings, kCamLUT);
+
+    if (sendDiffs && ctx->ccInit) {
+        if (ae != ctx->cAE) sendCmdBool(ctx, "setExposureAuto", ae);
+        if (iso != ctx->cISO) sendCmdFloat(ctx, "setISO", iso);
+        if (sh != ctx->cShutter) sendCmdFloat(ctx, "setShutter", sh);
+        if (awb != ctx->cAWB) sendCmdBool(ctx, "setWhiteBalanceAuto", awb);
+        if (wb != ctx->cWB) sendCmdFloat(ctx, "setWB", wb);
+        if (tint != ctx->cTint) sendCmdFloat(ctx, "setTint", tint);
+        if (af != ctx->cAF) sendCmdBool(ctx, "setFocusAuto", af);
+        if (focus != ctx->cFocus) sendCmdFloat(ctx, "setFocusPosition", focus);
+        if (lens != ctx->cLens) sendCmdString(ctx, "setLens", lens.c_str());
+        if (fps != ctx->cFPS) sendCmdInt(ctx, "setFPS", fps);
+        if (zoom != ctx->cZoom) sendCmdFloat(ctx, "setZoom", zoom);
+        if (lut != ctx->cLUT) sendCmdBool(ctx, "setLUT", lut);
+    }
+
+    ctx->cAE = ae; ctx->cISO = iso; ctx->cShutter = sh; ctx->cAWB = awb;
+    ctx->cWB = wb; ctx->cTint = tint; ctx->cAF = af; ctx->cFocus = focus;
+    ctx->cLens = lens; ctx->cFPS = fps; ctx->cZoom = zoom; ctx->cLUT = lut;
+    ctx->ccInit = true;
 }
 
 // ---- connection lifecycle -------------------------------------------------
@@ -452,6 +679,7 @@ void *source_create(obs_data_t *settings, obs_source_t *source) {
     ctx->source = source;
     ctx->did = loadOrCreateDid();
     apply_settings(ctx, settings);
+    applyCameraControls(ctx, settings, /*sendDiffs=*/false); // seed cache, don't command
     rebuildConnection(ctx);
     return ctx;
 }
@@ -467,14 +695,28 @@ void source_update(void *data, obs_data_t *settings) {
     auto *ctx = static_cast<AirliveSourceCtx *>(data);
     const std::string prevDev = ctx->dev, prevSrc = ctx->src;
     apply_settings(ctx, settings); // delay changes apply immediately (read per-frame)
+    applyCameraControls(ctx, settings, /*sendDiffs=*/true); // send whatever the operator changed
     if (ctx->dev != prevDev || ctx->src != prevSrc)
         rebuildConnection(ctx); // re-advertise under the new display names
 }
 
 void source_get_defaults(obs_data_t *settings) {
     obs_data_set_default_string(settings, kSettingDeviceName, "Airlive OBS");
-    // No default for source_name — apply_settings assigns "OBS Source N" once.
+    // No default for source_name — apply_settings adopts the OBS source name once.
     obs_data_set_default_int(settings, kSettingDelayMs, kDefaultDelayMs);
+
+    obs_data_set_default_bool(settings, kCamAE, true);
+    obs_data_set_default_int(settings, kCamISO, 100);
+    obs_data_set_default_int(settings, kCamShutter, 50);
+    obs_data_set_default_bool(settings, kCamAWB, true);
+    obs_data_set_default_int(settings, kCamWB, 5600);
+    obs_data_set_default_int(settings, kCamTint, 0);
+    obs_data_set_default_bool(settings, kCamAF, true);
+    obs_data_set_default_double(settings, kCamFocus, 0.5);
+    obs_data_set_default_string(settings, kCamLens, "1x");
+    obs_data_set_default_int(settings, kCamFPS, 30);
+    obs_data_set_default_double(settings, kCamZoom, 1.0);
+    obs_data_set_default_bool(settings, kCamLUT, false);
 }
 
 // Tally callbacks — recompute and push the cue on every activation/visibility change.
@@ -496,6 +738,9 @@ std::string buildStatusText(AirliveSourceCtx *ctx) {
             if (fps > 0)
                 s += " @ " + std::to_string(fps) + " fps";
         }
+        if (const int rot = ctx->rotationDeg.load())
+            s += "\nRotation: " + std::to_string(rot) + "° " +
+                 ((rot == 90 || rot == 270) ? "(portrait)" : "(flipped)");
         std::lock_guard<std::mutex> lk(ctx->stateMutex);
         if (!ctx->rDevice.empty())
             s += "\nDevice: " + ctx->rDevice;
@@ -503,8 +748,29 @@ std::string buildStatusText(AirliveSourceCtx *ctx) {
             s += "\nCamera: " + ctx->rResolution + (ctx->rColorSpace.empty() ? "" : " " + ctx->rColorSpace);
         if (!ctx->rLens.empty())
             s += "\nLens: " + ctx->rLens;
+        // Live exposure / WB readout (actual camera values, not the slider state).
+        if (ctx->rIso > 0)
+            s += "\nISO " + std::to_string(int(ctx->rIso + 0.5)) + (ctx->rAE ? " (auto)" : "");
+        if (ctx->rShutter > 0)
+            s += "  ·  1/" + std::to_string(int(ctx->rShutter + 0.5));
+        if (ctx->rWB > 0)
+            s += "\nWB " + std::to_string(int(ctx->rWB + 0.5)) + "K" + (ctx->rAWB ? " (auto)" : "");
     }
     return s;
+}
+
+// Grey out the manual controls whose auto-mode is on. Fires when an auto toggle
+// changes; returning true tells OBS to refresh the property view.
+bool cam_auto_modified(obs_properties_t *props, obs_property_t *, obs_data_t *settings) {
+    const bool ae = obs_data_get_bool(settings, kCamAE);
+    const bool awb = obs_data_get_bool(settings, kCamAWB);
+    const bool af = obs_data_get_bool(settings, kCamAF);
+    obs_property_set_enabled(obs_properties_get(props, kCamISO), !ae);
+    obs_property_set_enabled(obs_properties_get(props, kCamShutter), !ae);
+    obs_property_set_enabled(obs_properties_get(props, kCamWB), !awb);
+    obs_property_set_enabled(obs_properties_get(props, kCamTint), !awb);
+    obs_property_set_enabled(obs_properties_get(props, kCamFocus), !af);
+    return true;
 }
 
 bool refresh_clicked(obs_properties_t *, obs_property_t *, void *) {
@@ -540,6 +806,49 @@ obs_properties_t *source_get_properties(void *data) {
                             OBS_TEXT_DEFAULT);
     obs_properties_add_text(props, kSettingSourceName, obs_module_text("Airlive.SourceLabel"),
                             OBS_TEXT_DEFAULT);
+
+    // ---- Camera control (Phase 2a) ----
+    // Send-only knobs: changing one ships a set-command to the iPhone. The
+    // actual camera values are in the status readout above (Refresh to update).
+    obs_properties_add_text(props, "cam_hdr", "— Camera control —", OBS_TEXT_INFO);
+
+    obs_property_t *ae = obs_properties_add_bool(props, kCamAE, "Auto exposure");
+    obs_property_t *iso = obs_properties_add_int_slider(props, kCamISO, "ISO", 20, 12800, 1);
+    obs_property_t *shutter =
+        obs_properties_add_int_slider(props, kCamShutter, "Shutter 1/x", 24, 8000, 1);
+
+    obs_property_t *awb = obs_properties_add_bool(props, kCamAWB, "Auto white balance");
+    obs_property_t *wb = obs_properties_add_int_slider(props, kCamWB, "White balance (K)", 2300, 10000, 50);
+    obs_property_t *tint = obs_properties_add_int_slider(props, kCamTint, "Tint", -150, 150, 1);
+
+    obs_property_t *af = obs_properties_add_bool(props, kCamAF, "Auto focus");
+    obs_property_t *focus = obs_properties_add_float_slider(props, kCamFocus, "Focus", 0.0, 1.0, 0.01);
+
+    obs_property_t *lens =
+        obs_properties_add_list(props, kCamLens, "Lens", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+    for (const char *l : {"0.5x", "1x", "2x", "3x", "5x"})
+        obs_property_list_add_string(lens, l, l);
+
+    obs_property_t *fps =
+        obs_properties_add_list(props, kCamFPS, "FPS", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    for (int f : {24, 25, 30, 50, 60})
+        obs_property_list_add_int(fps, std::to_string(f).c_str(), f);
+
+    obs_properties_add_float_slider(props, kCamZoom, "Zoom", 1.0, 15.0, 0.1);
+    obs_properties_add_bool(props, kCamLUT, "LUT on");
+
+    // Auto toggles drive the grey-out of their manual partners — live (callback)
+    // and on open (seed from the last-known auto state in ctx).
+    obs_property_set_modified_callback(ae, cam_auto_modified);
+    obs_property_set_modified_callback(awb, cam_auto_modified);
+    obs_property_set_modified_callback(af, cam_auto_modified);
+    if (ctx) {
+        obs_property_set_enabled(iso, !ctx->cAE);
+        obs_property_set_enabled(shutter, !ctx->cAE);
+        obs_property_set_enabled(wb, !ctx->cAWB);
+        obs_property_set_enabled(tint, !ctx->cAWB);
+        obs_property_set_enabled(focus, !ctx->cAF);
+    }
     return props;
 }
 
