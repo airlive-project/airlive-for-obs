@@ -1,11 +1,13 @@
 #include "airlive-connection.hpp"
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <vector>
 
 #include <obs-module.h>
 
+#include "auth.hpp"
 #include "net-compat.hpp"
 #include "wire.hpp"
 
@@ -24,6 +26,17 @@ constexpr size_t kRecvChunk = 64 * 1024;
 // half-open connection and block every reconnect.
 constexpr int kStallTimeoutMs = 8000;
 
+// Auth handshake budget: how long we wait for a valid response before FINning a
+// connection that never authenticates. Pinned to 15 s across ALL receivers
+// (STREAM-AUTH-SPEC §4) so behavior is consistent with the Bridge / Studio.
+constexpr int kAuthStallTimeoutMs = 15000;
+
+// Anti-bruteforce: after this many failed attempts from one source, ban it for
+// an exponentially growing window (base × 2^over), capped.
+constexpr int kAuthMaxFailures = 5;
+constexpr int64_t kAuthBanBaseMs = 30000;
+constexpr int64_t kAuthBanMaxMs = 600000;
+
 void setNonBlocking(socket_t s) {
 #ifdef _WIN32
     u_long mode = 1;
@@ -32,6 +45,26 @@ void setNonBlocking(socket_t s) {
     int flags = fcntl(s, F_GETFL, 0);
     fcntl(s, F_SETFL, flags | O_NONBLOCK);
 #endif
+}
+
+// Monotonic milliseconds for ban deadlines (never walks backward on a clock set).
+int64_t nowMs() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+// Human-readable remote IP for the anti-bruteforce key. The listen socket is
+// dual-stack, so peers arrive as AF_INET6 (IPv4 shows as "::ffff:a.b.c.d").
+std::string peerKeyFromSockaddr(const sockaddr_storage &ss) {
+    char buf[INET6_ADDRSTRLEN] = {0};
+    if (ss.ss_family == AF_INET6) {
+        auto *a = reinterpret_cast<const sockaddr_in6 *>(&ss);
+        inet_ntop(AF_INET6, &a->sin6_addr, buf, sizeof(buf));
+    } else if (ss.ss_family == AF_INET) {
+        auto *a = reinterpret_cast<const sockaddr_in *>(&ss);
+        inet_ntop(AF_INET, &a->sin_addr, buf, sizeof(buf));
+    }
+    return buf[0] ? std::string(buf) : std::string("?");
 }
 } // namespace
 
@@ -134,11 +167,22 @@ void AirliveConnection::run() {
         if (!(pfds[0].revents & POLLIN))
             continue; // only the bonjour fd was ready
 
-        socket_t client = ::accept(listenFd, nullptr, nullptr);
+        sockaddr_storage peer{};
+        socklen_t peerLen = sizeof(peer);
+        socket_t client = ::accept(listenFd, reinterpret_cast<sockaddr *>(&peer), &peerLen);
         if (client == kInvalidSocket)
             continue;
 
-        blog(LOG_INFO, "[airlive] iPhone connected");
+        const std::string peerKey = peerKeyFromSockaddr(peer);
+        // Anti-bruteforce: a source that just burned its auth attempts is refused
+        // outright (no slot, no challenge) until its ban expires.
+        if (isBanned(peerKey)) {
+            blog(LOG_INFO, "[airlive] refused banned source %s", peerKey.c_str());
+            close_socket(client);
+            continue;
+        }
+
+        blog(LOG_INFO, "[airlive] iPhone connected (%s)", peerKey.c_str());
 #ifdef SO_NOSIGPIPE
         // macOS/BSD: never raise SIGPIPE if the iPhone vanishes mid-send.
         int one = 1;
@@ -158,10 +202,11 @@ void AirliveConnection::run() {
             std::lock_guard<std::mutex> lk(sendMutex_);
             clientFd_ = client;
         }
-        connected_ = true;
-        bonjour_.setBusy(true);
+        // NOTE: connected_ / busy are NOT set here — serveClient flips them only
+        // AFTER auth passes (or immediately when auth is off), so an
+        // unauthenticated peer never reserves the slot (STREAM-AUTH-SPEC §4).
 
-        serveClient(client);
+        serveClient(client, peerKey);
 
         {
             std::lock_guard<std::mutex> lk(sendMutex_);
@@ -179,8 +224,26 @@ void AirliveConnection::run() {
     close_socket(listenFd);
 }
 
-void AirliveConnection::serveClient(socket_t client) {
+void AirliveConnection::serveClient(socket_t client, const std::string &peerKey) {
     setNonBlocking(client);
+
+    // Snapshot the auth config once for this whole connection so a settings
+    // change from the UI thread mid-handshake can't race the verify.
+    bool requireAuth;
+    std::string password;
+    {
+        std::lock_guard<std::mutex> lk(authMutex_);
+        requireAuth = authRequire_ && !authPassword_.empty();
+        password = authPassword_;
+    }
+    if (requireAuth && !runAuthHandshake(client, peerKey, password))
+        return; // rejected / timed out — run() closes the socket
+
+    // Authorized (or auth off): NOW reserve the slot + advertise busy. An
+    // unauthenticated peer never got this far, so it never held the channel.
+    connected_ = true;
+    bonjour_.setBusy(true);
+
     std::vector<uint8_t> chunk(kRecvChunk);
     int idleMs = 0; // time since the last byte — resets on every recv
 
@@ -238,30 +301,188 @@ void AirliveConnection::serveClient(socket_t client) {
                 if (controlSink_)
                     controlSink_(reinterpret_cast<const char *>(pkt.payload), pkt.payload_len);
                 break;
+            case PacketType::AuthChallenge:
+            case PacketType::AuthResponse:
+            case PacketType::AuthResult:
+                // Auth packets matter only during the handshake; once authorized
+                // we never act on them and never re-verify per packet (the
+                // thermal-critical invariant). Ignore.
+                break;
             }
         });
     }
 }
 
+// ---- auth handshake (worker thread) ---------------------------------------
+//
+// The camera's send path is UNCHANGED: it streams formatDescription + samples
+// immediately, so those arrive interleaved with (or before) the response. We
+// buffer the latest format, DROP samples, and process ONLY the response until it
+// verifies or the stall timeout fires. We authorize ONLY on our own constant-
+// time verify of a type-4 — never because we received a type-5 (a forged
+// authResult) or any other packet (STREAM-AUTH-SPEC §3).
+bool AirliveConnection::runAuthHandshake(socket_t client, const std::string &peerKey,
+                                         const std::string &password) {
+    uint8_t nonce[kAuthTagLength];
+    fillNonce(nonce);
+    if (!sendRaw(PacketType::AuthChallenge, nonce, sizeof(nonce)))
+        return false; // couldn't even send the challenge — peer already gone
+    blog(LOG_INFO, "[airlive] auth challenge sent — awaiting response");
+
+    std::vector<uint8_t> chunk(kRecvChunk);
+    std::vector<uint8_t> pendingFormat; // latest format buffered while pending
+    int idleMs = 0;
+    bool decided = false; // first decision wins; ignore later packets
+    bool authorized = false;
+
+    while (running_.load() && !decided) {
+        poll_fd_t pfd{};
+        pfd.fd = client;
+        pfd.events = POLLIN;
+        const int pr = poll_sockets(&pfd, 1, kPollTimeoutMs);
+        if (pr < 0)
+            return false;
+        if (pr == 0) {
+            idleMs += kPollTimeoutMs;
+            if (idleMs >= kAuthStallTimeoutMs) {
+                blog(LOG_INFO, "[airlive] auth stall — no valid response in %d ms", idleMs);
+                sendAuthResult(false, "auth_required");
+                return false;
+            }
+            continue;
+        }
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+            return false;
+
+#ifdef _WIN32
+        const int n = ::recv(client, reinterpret_cast<char *>(chunk.data()), int(chunk.size()), 0);
+#else
+        const ssize_t n = ::recv(client, chunk.data(), chunk.size(), 0);
+#endif
+        if (n == 0)
+            return false; // peer closed
+        if (n < 0) {
+#ifdef _WIN32
+            if (WSAGetLastError() == WSAEWOULDBLOCK)
+                continue;
+#else
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                continue;
+#endif
+            return false;
+        }
+        idleMs = 0;
+
+        bool violation = false;
+        parser_.feed(chunk.data(), size_t(n), [&](const Packet &pkt) {
+            if (decided)
+                return; // a decision was already made this feed — ignore the rest
+            switch (pkt.type) {
+            case PacketType::AuthResponse:
+                // Length-check BEFORE verify (a non-32-byte tag is a failure
+                // outright), then constant-time verify of THIS nonce.
+                if (pkt.payload_len == size_t(kAuthTagLength) &&
+                    authVerify(password, nonce, sizeof(nonce), pkt.payload, pkt.payload_len)) {
+                    decided = true;
+                    authorized = true;
+                } else {
+                    decided = true; // wrong password
+                }
+                break;
+            case PacketType::FormatDescription:
+                pendingFormat.assign(pkt.payload, pkt.payload + pkt.payload_len);
+                break;
+            case PacketType::Sample:
+            case PacketType::Control:
+                break; // dropped while pending — process ONLY the response
+            case PacketType::AuthChallenge:
+            case PacketType::AuthResult:
+                // Receiver→camera only — a peer sending one is forging the
+                // handshake. Protocol violation → reject (never authorize on it).
+                decided = true;
+                violation = true;
+                break;
+            }
+        });
+
+        if (decided) {
+            if (authorized) {
+                sendAuthResult(true);
+                if (!pendingFormat.empty())
+                    decoder_.setParameterSets(pendingFormat.data(), pendingFormat.size());
+                clearBan(peerKey);
+                blog(LOG_INFO, "[airlive] authorized");
+                return true;
+            }
+            registerAuthFailure(peerKey);
+            sendAuthResult(false, "auth_failed");
+            blog(LOG_INFO, "[airlive] auth %s", violation ? "protocol violation" : "failed (wrong password)");
+            return false;
+        }
+    }
+    return false; // running_ went false mid-handshake
+}
+
+// Convenience: frame + send an AuthResult JSON packet (uses the live clientFd_).
+void AirliveConnection::sendAuthResult(bool ok, const char *reason) {
+    const std::string json = authResultJSON(ok, reason);
+    sendRaw(PacketType::AuthResult, reinterpret_cast<const uint8_t *>(json.data()), json.size());
+}
+
+// ---- anti-bruteforce ledger (worker-thread only) --------------------------
+
+bool AirliveConnection::isBanned(const std::string &peerKey) const {
+    auto it = authBans_.find(peerKey);
+    return it != authBans_.end() && it->second.second > nowMs();
+}
+
+void AirliveConnection::registerAuthFailure(const std::string &peerKey) {
+    auto &entry = authBans_[peerKey]; // {failures, banUntilMs}
+    entry.first += 1;
+    if (entry.first >= kAuthMaxFailures) {
+        const int over = entry.first - kAuthMaxFailures;
+        int64_t ban = kAuthBanBaseMs << (over > 20 ? 20 : over); // base × 2^over, guarded
+        if (ban > kAuthBanMaxMs || ban <= 0)
+            ban = kAuthBanMaxMs;
+        entry.second = nowMs() + ban;
+        blog(LOG_INFO, "[airlive] %s banned %lld ms after %d failed attempts",
+             peerKey.c_str(), (long long)ban, entry.first);
+    }
+}
+
+void AirliveConnection::clearBan(const std::string &peerKey) { authBans_.erase(peerKey); }
+
+void AirliveConnection::setAuth(bool require, std::string password) {
+    std::lock_guard<std::mutex> lk(authMutex_);
+    authRequire_ = require;
+    authPassword_ = std::move(password);
+}
+
 bool AirliveConnection::sendControl(const std::string &json) {
-    // Frame a type-2 packet: 18-byte header (big-endian) + JSON payload.
+    return sendRaw(PacketType::Control,
+                   reinterpret_cast<const uint8_t *>(json.data()), json.size());
+}
+
+bool AirliveConnection::sendRaw(PacketType type, const uint8_t *payload, size_t len) {
+    // Frame the packet: 18-byte header (big-endian) + payload.
     std::vector<uint8_t> out;
-    out.reserve(kHeaderSize + json.size());
+    out.reserve(kHeaderSize + len);
     const uint32_t m = kMagic;
     out.push_back(uint8_t(m >> 24));
     out.push_back(uint8_t(m >> 16));
     out.push_back(uint8_t(m >> 8));
     out.push_back(uint8_t(m));
     out.push_back(kProtocolVersion);
-    out.push_back(uint8_t(PacketType::Control));
-    const uint32_t len = uint32_t(json.size());
-    out.push_back(uint8_t(len >> 24));
-    out.push_back(uint8_t(len >> 16));
-    out.push_back(uint8_t(len >> 8));
-    out.push_back(uint8_t(len));
+    out.push_back(uint8_t(type));
+    const uint32_t plen = uint32_t(len);
+    out.push_back(uint8_t(plen >> 24));
+    out.push_back(uint8_t(plen >> 16));
+    out.push_back(uint8_t(plen >> 8));
+    out.push_back(uint8_t(plen));
     for (int i = 0; i < 8; ++i)
-        out.push_back(0); // timestamp_us = 0 for control messages
-    out.insert(out.end(), json.begin(), json.end());
+        out.push_back(0); // timestamp_us = 0 for control / auth messages
+    if (len)
+        out.insert(out.end(), payload, payload + len);
 
 #ifdef MSG_NOSIGNAL
     const int flags = MSG_NOSIGNAL; // Linux: suppress SIGPIPE on a dead peer

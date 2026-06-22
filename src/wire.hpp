@@ -33,8 +33,21 @@ constexpr uint32_t kMaxPayloadLength = 16u * 1024u * 1024u;
 enum class PacketType : uint8_t {
     FormatDescription = 0, // length-prefixed SPS/PPS parameter sets
     Sample            = 1, // one encoded access unit, AVCC (4-byte length-prefixed NALs)
-    Control           = 2, // JSON ControlMessage — ignored in v1 (video-only)
+    Control           = 2, // JSON ControlMessage — iPhone state snapshot / set-cmds
+    // ── Receiver-password auth (challenge-response, HMAC) ──────────────────
+    // Additive; kProtocolVersion is NOT bumped (an auth-OFF receiver never sends
+    // these, so old camera ↔ new plugin is byte-identical).  See the FROZEN
+    // docs/STREAM-AUTH-SPEC.md.  Payloads:
+    //   AuthChallenge (receiver→camera): 32 raw bytes, single-use nonce.
+    //   AuthResponse  (camera→receiver): 32 raw bytes, HMAC-SHA256 tag.
+    //   AuthResult    (receiver→camera): JSON {"ok":bool,"reason"?:string}.
+    AuthChallenge     = 3,
+    AuthResponse      = 4,
+    AuthResult        = 5,
 };
+
+// SHA-256 output size: a challenge nonce and a response tag are both 32 bytes.
+constexpr int kAuthTagLength = 32;
 
 // AVCC NAL length prefix is 4 bytes (nalUnitHeaderLength = 4).
 constexpr int kAvccLengthBytes = 4;

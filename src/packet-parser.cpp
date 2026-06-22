@@ -36,7 +36,9 @@ void PacketParser::feed(const uint8_t *data, size_t len, const Emit &emit) {
         if (h[4] != kProtocolVersion) { ++pos; continue; }
 
         const uint8_t rawType = h[5];
-        if (rawType > uint8_t(PacketType::Control)) { ++pos; continue; }
+        // Accept every known type INCLUDING the auth packets (3/4/5); anything
+        // above AuthResult is an unknown/desynced byte → resync.
+        if (rawType > uint8_t(PacketType::AuthResult)) { ++pos; continue; }
 
         const uint32_t payloadLen = be32(h + 6);
         if (payloadLen > kMaxPayloadLength) { ++pos; continue; }

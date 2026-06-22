@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -52,10 +53,38 @@ public:
     // no iPhone is connected or the send was dropped (so the caller can retry).
     bool sendControl(const std::string &json);
 
+    // Apply the receiver-password auth config (called from the OBS UI thread when
+    // the source's properties change).  `require && !password.empty()` turns the
+    // challenge-response on for the NEXT connection.  Thread-safe; snapshotted by
+    // the worker when a client connects, so a mid-handshake change can't race.
+    void setAuth(bool require, std::string password);
+
 private:
     void run();                        // thread body
     socket_t openListenSocket(uint16_t &outPort);
-    void serveClient(socket_t client); // blocking read loop for one iPhone
+    // Blocking read loop for one iPhone.  `peerKey` (remote IP) keys the
+    // anti-bruteforce ledger.  Runs the auth handshake first when required.
+    void serveClient(socket_t client, const std::string &peerKey);
+
+    // Auth handshake (worker thread).  Sends one challenge, processes ONLY the
+    // response (buffering the latest format, dropping samples) until it verifies
+    // or times out.  Returns true ⇒ authorized (caller goes live), false ⇒ the
+    // connection was rejected/closed.
+    bool runAuthHandshake(socket_t client, const std::string &peerKey,
+                          const std::string &password);
+
+    // Frame + send any packet type back to the iPhone (the generic primitive
+    // behind sendControl and the auth packets).  Thread-safe.
+    bool sendRaw(PacketType type, const uint8_t *payload, size_t len);
+
+    // Frame + send an AuthResult JSON packet over the live client fd.
+    void sendAuthResult(bool ok, const char *reason = nullptr);
+
+    // Anti-bruteforce (worker-thread only — no lock needed): per-source failure
+    // count + ban deadline.  isBanned/registerAuthFailure/clearBan operate on it.
+    bool isBanned(const std::string &peerKey) const;
+    void registerAuthFailure(const std::string &peerKey);
+    void clearBan(const std::string &peerKey);
 
     ServiceIdentity identity_;
     BonjourService bonjour_;
@@ -71,6 +100,15 @@ private:
     // writes to a fd the worker thread is closing.
     std::mutex sendMutex_;
     socket_t clientFd_{kInvalidSocket};
+
+    // Auth config — written from the OBS UI thread, read by the worker.  Guarded
+    // by authMutex_; the worker snapshots it once per connection.
+    mutable std::mutex authMutex_;
+    bool authRequire_{false};
+    std::string authPassword_;
+
+    // Per-source failure ledger (IP → {failures, banUntilMs}).  Worker-only.
+    std::map<std::string, std::pair<int, int64_t>> authBans_;
 };
 
 } // namespace airlive

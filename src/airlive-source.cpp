@@ -51,6 +51,9 @@ constexpr const char *kSettingDeviceName = "device_name";
 constexpr const char *kSettingSourceName = "source_name";
 constexpr const char *kSettingDelayMs = "delay_ms";
 constexpr const char *kSettingSid = "sid"; // hidden — stable per-source id
+// Receiver-password auth (STREAM-AUTH-SPEC). Off by default.
+constexpr const char *kSettingRequireAuth = "require_auth";
+constexpr const char *kSettingPassword = "auth_password";
 
 // Phase-2a camera-control properties — each maps to a type-2 set-command sent to
 // the iPhone when the operator changes it. SEND-only (live readback goes to the
@@ -620,6 +623,19 @@ ServiceIdentity makeIdentity(const AirliveSourceCtx *ctx) {
     return ServiceIdentity{ctx->did, ctx->dev, ctx->sid, ctx->src};
 }
 
+// Push the receiver-password auth config to the connection (STREAM-AUTH-SPEC).
+// Auth engages only when the toggle is on AND a password is set; OFF by default.
+// NOTE: the password is stored in OBS settings (scene-collection JSON) — see the
+// caveat by the property below. A change applies to the NEXT connection (the
+// operator re-taps Live on the iPhone to re-authenticate).
+void applyAuth(AirliveSourceCtx *ctx, obs_data_t *settings) {
+    if (!ctx->conn)
+        return;
+    const bool require = obs_data_get_bool(settings, kSettingRequireAuth);
+    const char *pw = obs_data_get_string(settings, kSettingPassword);
+    ctx->conn->setAuth(require, pw ? pw : "");
+}
+
 // (Re)build the connection with the current identity. Called on create and
 // whenever a renameable property changes (new names must hit the TXT record).
 void rebuildConnection(AirliveSourceCtx *ctx) {
@@ -681,6 +697,7 @@ void *source_create(obs_data_t *settings, obs_source_t *source) {
     apply_settings(ctx, settings);
     applyCameraControls(ctx, settings, /*sendDiffs=*/false); // seed cache, don't command
     rebuildConnection(ctx);
+    applyAuth(ctx, settings); // push auth config to the fresh connection
     return ctx;
 }
 
@@ -698,12 +715,14 @@ void source_update(void *data, obs_data_t *settings) {
     applyCameraControls(ctx, settings, /*sendDiffs=*/true); // send whatever the operator changed
     if (ctx->dev != prevDev || ctx->src != prevSrc)
         rebuildConnection(ctx); // re-advertise under the new display names
+    applyAuth(ctx, settings); // (re-)push auth — also re-pushes after a rebuild
 }
 
 void source_get_defaults(obs_data_t *settings) {
     obs_data_set_default_string(settings, kSettingDeviceName, "Airlive OBS");
     // No default for source_name — apply_settings adopts the OBS source name once.
     obs_data_set_default_int(settings, kSettingDelayMs, kDefaultDelayMs);
+    obs_data_set_default_bool(settings, kSettingRequireAuth, false); // open by default
 
     obs_data_set_default_bool(settings, kCamAE, true);
     obs_data_set_default_int(settings, kCamISO, 100);
@@ -806,6 +825,22 @@ obs_properties_t *source_get_properties(void *data) {
                             OBS_TEXT_DEFAULT);
     obs_properties_add_text(props, kSettingSourceName, obs_module_text("Airlive.SourceLabel"),
                             OBS_TEXT_DEFAULT);
+
+    // ---- Security: receiver-password auth (STREAM-AUTH-SPEC) ----
+    // Off by default — the stream stays open until the operator turns this on AND
+    // sets a password. Closes the same-LAN-prankster threat (slot-grab / fake-feed
+    // injection); it is ACCESS control, not encryption. The camera answers an HMAC
+    // challenge — the password never crosses the wire.
+    // CAVEAT: the password is stored in OBS's scene-collection settings (the same
+    // place OBS keeps stream keys), i.e. plaintext on disk. TODO: move to the OS
+    // secret store (macOS Keychain / libsecret / DPAPI) per the spec — tracked as
+    // a follow-up; keep passwords ASCII for cross-platform byte-identity.
+    obs_properties_add_text(props, "sec_hdr", "— Security —", OBS_TEXT_INFO);
+    obs_properties_add_bool(props, kSettingRequireAuth, "Require password");
+    obs_property_t *pw = obs_properties_add_text(props, kSettingPassword, "Password", OBS_TEXT_PASSWORD);
+    obs_property_set_long_description(
+        pw, "Cameras must enter this to connect. Changing it takes effect on the next "
+            "connection (re-tap Live on the iPhone). ASCII only.");
 
     // ---- Camera control (Phase 2a) ----
     // Send-only knobs: changing one ships a set-command to the iPhone. The
