@@ -90,6 +90,7 @@ struct AirliveSourceCtx {
     std::string sid; // per-source stable id
     std::string dev; // group display name
     std::string src; // source display name
+    std::string role = "obs"; // "obs" (direct iPhone) or "obs-bridge" (Bridge program)
     std::unique_ptr<AirliveConnection> conn;
 
     std::atomic<int> delayMs{kDefaultDelayMs};
@@ -621,7 +622,7 @@ void applyCameraControls(AirliveSourceCtx *ctx, obs_data_t *settings, bool sendD
 // ---- connection lifecycle -------------------------------------------------
 
 ServiceIdentity makeIdentity(const AirliveSourceCtx *ctx) {
-    return ServiceIdentity{ctx->did, ctx->dev, ctx->sid, ctx->src};
+    return ServiceIdentity{ctx->did, ctx->dev, ctx->sid, ctx->src, ctx->role};
 }
 
 // Push the receiver-password auth config to the connection (STREAM-AUTH-SPEC §4).
@@ -667,6 +668,10 @@ const char *source_get_name(void *) {
     return obs_module_text("Airlive.SourceName");
 }
 
+const char *source_get_name_bridge(void *) {
+    return "OBS Airlive Bridge";
+}
+
 void apply_settings(AirliveSourceCtx *ctx, obs_data_t *settings) {
     ctx->dev = obs_data_get_string(settings, kSettingDeviceName);
 
@@ -698,15 +703,28 @@ void apply_settings(AirliveSourceCtx *ctx, obs_data_t *settings) {
     }
 }
 
-void *source_create(obs_data_t *settings, obs_source_t *source) {
+void *createWithRole(obs_data_t *settings, obs_source_t *source, const char *role) {
     auto *ctx = new AirliveSourceCtx();
     ctx->source = source;
+    ctx->role = role;
     ctx->did = loadOrCreateDid();
     apply_settings(ctx, settings);
     applyCameraControls(ctx, settings, /*sendDiffs=*/false); // seed cache, don't command
     rebuildConnection(ctx);
     applyAuth(ctx, settings); // push auth config to the fresh connection
     return ctx;
+}
+
+// "OBS Airlive" — receives directly from an iPhone (Airlive Camera).
+void *source_create(obs_data_t *settings, obs_source_t *source) {
+    return createWithRole(settings, source, "obs");
+}
+
+// "OBS Airlive Bridge" — receives the PROGRAM from the Airlive Bridge app.  A
+// SEPARATE source (distinct Bonjour role) so it can run alongside a direct iPhone
+// source without competing for the same slot.
+void *source_create_bridge(obs_data_t *settings, obs_source_t *source) {
+    return createWithRole(settings, source, "obs-bridge");
 }
 
 void source_destroy(void *data) {
@@ -921,22 +939,22 @@ obs_properties_t *source_get_properties(void *data) {
     return props;
 }
 
-struct obs_source_info airlive_source_info = []() {
+// Shared builder for both source types — identical except id / display name /
+// create (which sets the Bonjour role).
+struct obs_source_info makeSourceInfo(const char *id,
+                                      const char *(*getName)(void *),
+                                      void *(*create)(obs_data_t *, obs_source_t *)) {
     struct obs_source_info info = {};
-    // Distinct id so OBS never confuses this with any older Airlive
-    // screen-mirroring plugin already installed on the machine.
-    info.id = "airlive_obs_source";
+    info.id = id;
     info.type = OBS_SOURCE_TYPE_INPUT;
     info.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_DO_NOT_DUPLICATE;
     info.icon_type = OBS_ICON_TYPE_CAMERA;
-    info.get_name = source_get_name;
-    // Async sources get their dimensions from the output frames, so these are
-    // optional — but some OBS internals/plugins query them before the first
-    // frame; back them with the live stats so they report real dims once video
-    // is flowing (0 until then, standard for async sources).
+    info.get_name = getName;
+    // Async sources get their dimensions from the output frames; back the queries
+    // with live stats so they report real dims once video flows (0 until then).
     info.get_width = [](void *d) -> uint32_t { return static_cast<AirliveSourceCtx *>(d)->statW.load(); };
     info.get_height = [](void *d) -> uint32_t { return static_cast<AirliveSourceCtx *>(d)->statH.load(); };
-    info.create = source_create;
+    info.create = create;
     info.destroy = source_destroy;
     info.update = source_update;
     info.get_defaults = source_get_defaults;
@@ -946,7 +964,17 @@ struct obs_source_info airlive_source_info = []() {
     info.show = source_show;
     info.hide = source_hide;
     return info;
-}();
+}
+
+// "OBS Airlive" — direct iPhone source.  Distinct id so OBS never confuses it
+// with any older Airlive screen-mirroring plugin.
+struct obs_source_info airlive_source_info =
+    makeSourceInfo("airlive_obs_source", source_get_name, source_create);
+
+// "OBS Airlive Bridge" — receives the Airlive Bridge program (role "obs-bridge"),
+// runs alongside the direct source without slot conflict.
+struct obs_source_info airlive_bridge_source_info =
+    makeSourceInfo("airlive_obs_bridge_source", source_get_name_bridge, source_create_bridge);
 
 } // namespace
 
@@ -964,7 +992,8 @@ bool obs_module_load(void) {
     signal(SIGPIPE, SIG_IGN);
 #endif
     obs_register_source(&airlive_source_info);
-    blog(LOG_INFO, "[airlive-obs] OBS Airlive loaded");
+    obs_register_source(&airlive_bridge_source_info);
+    blog(LOG_INFO, "[airlive-obs] OBS Airlive + OBS Airlive Bridge loaded");
     return true;
 }
 

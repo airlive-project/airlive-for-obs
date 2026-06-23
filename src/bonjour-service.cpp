@@ -35,7 +35,7 @@ bool BonjourService::start(uint16_t port, const ServiceIdentity &id) {
     TXTRecordRef txt;
     TXTRecordCreate(&txt, 0, nullptr);
     setTxt(txt, "v", "1");
-    setTxt(txt, "role", "obs");
+    setTxt(txt, "role", id_.role.empty() ? "obs" : id_.role);
     setTxt(txt, "did", id_.did);
     setTxt(txt, "dev", id_.dev);
     setTxt(txt, "sid", id_.sid);
@@ -70,7 +70,7 @@ bool BonjourService::publishTxt(bool busy) {
     TXTRecordRef txt;
     TXTRecordCreate(&txt, 0, nullptr);
     setTxt(txt, "v", "1");
-    setTxt(txt, "role", "obs");
+    setTxt(txt, "role", id_.role.empty() ? "obs" : id_.role);
     setTxt(txt, "did", id_.did);
     setTxt(txt, "dev", id_.dev);
     setTxt(txt, "sid", id_.sid);

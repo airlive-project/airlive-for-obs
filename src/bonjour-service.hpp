@@ -24,6 +24,8 @@ struct ServiceIdentity {
     std::string dev; // group display name, default "OBS Airlive"
     std::string sid; // stable per-source id
     std::string src; // source display name, default "OBS Source N"
+    std::string role = "obs"; // Bonjour TXT role: "obs" (direct iPhone source) or
+                              // "obs-bridge" (receives the Airlive Bridge program)
 };
 
 class BonjourService {
