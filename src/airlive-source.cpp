@@ -669,7 +669,9 @@ const char *source_get_name(void *) {
 }
 
 const char *source_get_name_bridge(void *) {
-    return "OBS Airlive Bridge";
+    // "Airlive Bridge" — sorts right next to "Airlive Camera" in OBS's source menu
+    // (both under "Airlive"), instead of being scattered under "O".
+    return obs_module_text("Airlive.SourceNameBridge");
 }
 
 void apply_settings(AirliveSourceCtx *ctx, obs_data_t *settings) {
@@ -745,6 +747,10 @@ void source_update(void *data, obs_data_t *settings) {
 }
 
 void source_get_defaults(obs_data_t *settings) {
+    // iPhone-FACING device name KEEPS "OBS" on purpose: the OBS menu/source is now
+    // "Airlive Camera", but the camera operator must still see this receiver is OBS (so
+    // the director knows where the signal lands).  The OBS display rename does NOT touch
+    // this Bonjour-advertised name.
     obs_data_set_default_string(settings, kSettingDeviceName, "OBS Airlive");
     // No default for source_name — apply_settings adopts the OBS source name once.
     obs_data_set_default_int(settings, kSettingDelayMs, kDefaultDelayMs);
