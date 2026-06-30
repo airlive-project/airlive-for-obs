@@ -132,6 +132,22 @@ struct AirliveSourceCtx {
     double rIso = 0, rShutter = 0, rWB = 0;
     int rFps = 0;
     bool rAE = false, rAWB = false;
+    // Device-read capability ranges (from StateSnapshot.capabilities) so the remote-control
+    // sliders match THIS phone instead of a hardcoded table.  Defaults = the previous hardcoded
+    // slider bounds, so an old camera that sends no `capabilities` = unchanged behaviour.
+    // (Guarded by stateMutex, like the r* fields above.)
+    double capIsoMin = 20, capIsoMax = 12800;
+    double capShutterMin = 24, capShutterMax = 8000;
+    double capWbMin = 2300, capWbMax = 10000;
+    double capTintMin = -150, capTintMax = 150;
+    // Device-read OPTION lists (availableLenses, capabilities.supportedFps).  Empty until a
+    // state arrives → the properties UI falls back to the standard ladders.
+    std::vector<std::string> capLenses;
+    std::vector<int> capFps;
+    bool capsReceived = false; // a StateSnapshot.capabilities object has arrived (vs. the defaults)
+    // Set by the "Refresh" button (UI thread); consumed by onControl (worker thread) to issue the
+    // actual obs_source_update_properties() — a property callback can't reload inline without UAF.
+    std::atomic<bool> refreshRequested{false};
 
     // Camera-control last-sent values: used to (a) detect which control the
     // operator actually changed in update(), and (b) seed the auto/manual
@@ -462,6 +478,21 @@ void onDecodedFrame(AirliveSourceCtx *ctx, const AVFrame *f, int64_t pts_us) {
         return; // still filling — nothing on air yet
     ctx->delayReached = true;
 
+    // Re-converge after a FORWARD timestamp gap (a lens/format switch pauses the
+    // camera ~0.3-0.5 s; a network stall does the same). Such a gap inflates the
+    // buffered span far past the target, and emitting one-per-frame would carry
+    // that gap as several frames of EXTRA latency on EVERY switch ("при смене линзы
+    // каждый раз добавляется задержка"). Instead drop the stale head in one shot so
+    // latency snaps back to the target. The margin is wide enough that ordinary
+    // capture jitter never trips it in steady state. (Backward jumps / >1 s gaps are
+    // already flushed by isTimestampJump above.)
+    const int64_t reconvergeMarginUs = 250000; // 250 ms over the target
+    while (ctx->dq.size() > 1 &&
+           (ctx->dq.back().pts_us - ctx->dq.front().pts_us) > intervalUs + reconvergeMarginUs) {
+        av_frame_free(&ctx->dq.front().frame);
+        ctx->dq.pop_front();
+    }
+
     QueuedFrame out = ctx->dq.front();
     ctx->dq.pop_front();
     outputFrame(ctx, out.frame, out.pts_us);
@@ -510,6 +541,49 @@ void ensureTally(AirliveSourceCtx *ctx, bool force) {
 // Parse an inbound type-2 JSON ControlMessage. We only read the state snapshot
 // for status display, then (re)assert tally so a freshly-connected phone learns
 // whether it's live.
+// Minimal extractors for a JSON array of strings / ints by key, from a WELL-FORMED control
+// message (Swift JSONEncoder output).  Needed because `obs_data` can't read JSON arrays of
+// primitives and jansson isn't exposed to OBS plugins.  Deliberately scoped to two flat arrays
+// (availableLenses, capabilities.supportedFps) whose values never contain `"` or `]` — NOT a
+// general JSON parser.  Returns the first match (each key is unique in the message).
+static std::vector<std::string> extractJsonStringArray(const std::string &j, const char *key) {
+    std::vector<std::string> out;
+    const std::string pat = std::string("\"") + key + "\"";
+    size_t k = j.find(pat);
+    if (k == std::string::npos) return out;
+    size_t lb = j.find('[', k);
+    size_t rb = (lb == std::string::npos) ? std::string::npos : j.find(']', lb);
+    if (lb == std::string::npos || rb == std::string::npos) return out;
+    size_t i = lb + 1;
+    while (i < rb) {
+        size_t q1 = j.find('"', i);
+        if (q1 == std::string::npos || q1 >= rb) break;
+        size_t q2 = j.find('"', q1 + 1);
+        if (q2 == std::string::npos || q2 > rb) break;
+        out.push_back(j.substr(q1 + 1, q2 - q1 - 1));
+        i = q2 + 1;
+    }
+    return out;
+}
+static std::vector<int> extractJsonIntArray(const std::string &j, const char *key) {
+    std::vector<int> out;
+    const std::string pat = std::string("\"") + key + "\"";
+    size_t k = j.find(pat);
+    if (k == std::string::npos) return out;
+    size_t lb = j.find('[', k);
+    size_t rb = (lb == std::string::npos) ? std::string::npos : j.find(']', lb);
+    if (lb == std::string::npos || rb == std::string::npos) return out;
+    size_t i = lb + 1;
+    while (i < rb) {
+        while (i < rb && (j[i] == ' ' || j[i] == ',')) i++;
+        if (i >= rb) break;
+        size_t start = i;
+        while (i < rb && j[i] != ',') i++;
+        try { out.push_back(std::stoi(j.substr(start, i - start))); } catch (...) {}
+    }
+    return out;
+}
+
 void onControl(AirliveSourceCtx *ctx, const char *json, size_t len) {
     const std::string s(json, len); // null-terminate for the JSON parser
     obs_data_t *msg = obs_data_create_from_json(s.c_str());
@@ -517,8 +591,13 @@ void onControl(AirliveSourceCtx *ctx, const char *json, size_t len) {
         return;
     bool gotState = false;
     if (obs_data_t *st = obs_data_get_obj(msg, "state")) {
+        std::string capsLog; // built under the lock, emitted after release (no I/O under stateMutex)
+        bool discreteChanged = false; // lens/fps/auto/first-caps changed → push a live dialog reload
         {
             std::lock_guard<std::mutex> lk(ctx->stateMutex);
+            const std::string oRLens = ctx->rLens;
+            const int oRFps = ctx->rFps;
+            const bool oRAE = ctx->rAE, oRAWB = ctx->rAWB;
             ctx->rDevice = obs_data_get_string(st, "deviceModel");
             ctx->rResolution = obs_data_get_string(st, "resolution");
             ctx->rColorSpace = obs_data_get_string(st, "colorSpace");
@@ -529,7 +608,62 @@ void onControl(AirliveSourceCtx *ctx, const char *json, size_t len) {
             ctx->rFps = int(obs_data_get_int(st, "fps"));
             ctx->rAE = obs_data_get_bool(st, "exposureAuto");
             ctx->rAWB = obs_data_get_bool(st, "whiteBalanceAuto");
+            // Device-read capability RANGES (additive object).  `has_user_value` guards each so a
+            // missing key keeps the default (and so tint's negative min isn't clobbered to 0).
+            const bool oCapsReceived = ctx->capsReceived;
+            const double oIsoMax = ctx->capIsoMax;
+            const size_t oLensN = ctx->capLenses.size(), oFpsN = ctx->capFps.size();
+            if (obs_data_t *caps = obs_data_get_obj(st, "capabilities")) {
+                ctx->capsReceived = true; // this phone reports real ranges, not our defaults
+                if (obs_data_has_user_value(caps, "isoMin"))          ctx->capIsoMin     = obs_data_get_double(caps, "isoMin");
+                if (obs_data_has_user_value(caps, "isoMax"))          ctx->capIsoMax     = obs_data_get_double(caps, "isoMax");
+                if (obs_data_has_user_value(caps, "shutterMinDenom")) ctx->capShutterMin = obs_data_get_double(caps, "shutterMinDenom");
+                if (obs_data_has_user_value(caps, "shutterMaxDenom")) ctx->capShutterMax = obs_data_get_double(caps, "shutterMaxDenom");
+                if (obs_data_has_user_value(caps, "wbTempMin"))       ctx->capWbMin      = obs_data_get_double(caps, "wbTempMin");
+                if (obs_data_has_user_value(caps, "wbTempMax"))       ctx->capWbMax      = obs_data_get_double(caps, "wbTempMax");
+                if (obs_data_has_user_value(caps, "wbTintMin"))       ctx->capTintMin    = obs_data_get_double(caps, "wbTintMin");
+                if (obs_data_has_user_value(caps, "wbTintMax"))       ctx->capTintMax    = obs_data_get_double(caps, "wbTintMax");
+                obs_data_release(caps);
+            }
+            // Option lists are JSON arrays of primitives — obs_data can't read those and jansson
+            // isn't exposed to plugins, so they're pulled from the raw message by the targeted
+            // extractors above. Only overwrite when present so an old camera keeps the fallback ladder.
+            auto lenses = extractJsonStringArray(s, "availableLenses");
+            if (!lenses.empty()) ctx->capLenses = std::move(lenses);
+            auto fpsList = extractJsonIntArray(s, "supportedFps");
+            if (!fpsList.empty()) ctx->capFps = std::move(fpsList);
+            // Format the "caps changed" line here (cheap, CPU-only) but DON'T blog yet —
+            // emit it after the lock releases so file I/O never runs inside the critical
+            // section (matches ensureTally). Logged once per ACTUAL change so the operator
+            // can confirm in the OBS log that THIS phone's caps arrived vs. default ranges.
+            if (ctx->capIsoMax != oIsoMax || ctx->capLenses.size() != oLensN ||
+                ctx->capFps.size() != oFpsN) {
+                char buf[256];
+                snprintf(buf, sizeof(buf),
+                         "[airlive] capabilities from phone: ISO %d-%d, shutter 1/%d-1/%d, "
+                         "WB %d-%dK, tint %d..%d, lenses=%zu, fps=%zu",
+                         int(ctx->capIsoMin), int(ctx->capIsoMax), int(ctx->capShutterMin),
+                         int(ctx->capShutterMax), int(ctx->capWbMin), int(ctx->capWbMax),
+                         int(ctx->capTintMin), int(ctx->capTintMax), ctx->capLenses.size(),
+                         ctx->capFps.size());
+                capsLog = buf;
+            }
+            // Only a DISCRETE change pushes a live dialog reload (below). iso/shutter/wb drift
+            // continuously under auto-exposure — reloading on those would rebuild the dialog ~1 Hz
+            // and fight an operator mid-edit. A first capabilities arrival also counts (ranges show).
+            discreteChanged = (ctx->rLens != oRLens) || (ctx->rFps != oRFps) ||
+                              (ctx->rAE != oRAE) || (ctx->rAWB != oRAWB) ||
+                              (!oCapsReceived && ctx->capsReceived);
         }
+        if (!capsLog.empty())
+            blog(LOG_INFO, "%s", capsLog.c_str());
+        // Make the OPEN Properties dialog (if any) re-run get_properties so the status text, the
+        // capability ranges and the control-widget reseed reflect the new state. MUST come from this
+        // worker thread, NOT a property callback: from the UI thread the signal handler re-enters and
+        // frees the live widgets mid-callback (UAF). Off-thread the frontend queues the reload safely.
+        // No-op when no dialog is open. Also serves the manual "Refresh" button (sets refreshRequested).
+        if (discreteChanged || ctx->refreshRequested.exchange(false))
+            obs_source_update_properties(ctx->source);
         // Additive presentation rotation (clockwise; absent/0 = landscape).
         ctx->rotationDeg.store(normalizeRotation(int(obs_data_get_int(st, "outputRotation"))));
         obs_data_release(st);
@@ -806,6 +940,29 @@ std::string buildStatusText(AirliveSourceCtx *ctx) {
             s += "  ·  1/" + std::to_string(int(ctx->rShutter + 0.5));
         if (ctx->rWB > 0)
             s += "\nWB " + std::to_string(int(ctx->rWB + 0.5)) + "K" + (ctx->rAWB ? " (auto)" : "");
+
+        // Device-read capability ranges/options — makes it VISIBLE whether the
+        // remote-control sliders/lists below reflect THIS phone or fall back to the
+        // defaults (answers "are these values current?"). Refresh / reopen re-reads.
+        if (ctx->capsReceived) {
+            s += "\nRanges: ISO " + std::to_string(int(ctx->capIsoMin)) + "–" +
+                 std::to_string(int(ctx->capIsoMax)) + " · 1/" +
+                 std::to_string(int(ctx->capShutterMin)) + "–1/" +
+                 std::to_string(int(ctx->capShutterMax)) + " · WB " +
+                 std::to_string(int(ctx->capWbMin)) + "–" + std::to_string(int(ctx->capWbMax)) + "K";
+            if (!ctx->capLenses.empty()) {
+                s += "\nLenses: ";
+                for (size_t i = 0; i < ctx->capLenses.size(); ++i)
+                    s += (i ? ", " : "") + ctx->capLenses[i];
+            }
+            if (!ctx->capFps.empty()) {
+                s += "\nFPS: ";
+                for (size_t i = 0; i < ctx->capFps.size(); ++i)
+                    s += (i ? ", " : "") + std::to_string(ctx->capFps[i]);
+            }
+        } else {
+            s += "\n(Capabilities: defaults — none received from this camera yet)";
+        }
     }
     // Auth status (independent of connection) — confirms a password is stored,
     // since the password field blanks itself after saving (it's in the Keychain).
@@ -836,8 +993,13 @@ bool cam_auto_modified(obs_properties_t *props, obs_property_t *, obs_data_t *se
     return true;
 }
 
-bool refresh_clicked(obs_properties_t *, obs_property_t *, void *) {
-    return true; // returning true rebuilds the property view -> re-reads status
+bool refresh_clicked(obs_properties_t *, obs_property_t *, void *data) {
+    // A property callback runs on the UI thread, where obs_source_update_properties() would
+    // re-enter and free these very widgets mid-callback (UAF). So flag it instead: the connection
+    // worker (onControl) issues the real reload on the next state message (≤1 s while connected).
+    if (auto *ctx = static_cast<AirliveSourceCtx *>(data))
+        ctx->refreshRequested.store(true);
+    return true; // also re-render the existing widgets immediately (harmless)
 }
 
 // Delete the stored password from the Keychain and push the now-empty config to
@@ -914,21 +1076,81 @@ obs_properties_t *source_get_properties(void *data) {
     obs_property_t *wb = obs_properties_add_int_slider(props, kCamWB, "White balance (K)", 2300, 10000, 50);
     obs_property_t *tint = obs_properties_add_int_slider(props, kCamTint, "Tint", -150, 150, 1);
 
+    // Override the slider bounds with this phone's device-read capabilities (from the last state
+    // snapshot) so they match the actual camera — Refresh / reopen the dialog after connecting to
+    // pick them up.  No state yet → defaults above (unchanged).
+    if (ctx) {
+        double isoMin, isoMax, shMin, shMax, wbMin, wbMax, tMin, tMax;
+        {
+            std::lock_guard<std::mutex> lk(ctx->stateMutex);
+            isoMin = ctx->capIsoMin; isoMax = ctx->capIsoMax;
+            shMin  = ctx->capShutterMin; shMax = ctx->capShutterMax;
+            wbMin  = ctx->capWbMin; wbMax = ctx->capWbMax;
+            tMin   = ctx->capTintMin; tMax = ctx->capTintMax;
+        }
+        obs_property_int_set_limits(iso,     int(isoMin), int(isoMax), 1);
+        obs_property_int_set_limits(shutter, int(shMin),  int(shMax),  1);
+        obs_property_int_set_limits(wb,      int(wbMin),  int(wbMax),  50);
+        obs_property_int_set_limits(tint,    int(tMin),   int(tMax),   1);
+    }
+
     obs_property_t *af = obs_properties_add_bool(props, kCamAF, "Auto focus");
     obs_property_t *focus = obs_properties_add_float_slider(props, kCamFocus, "Focus", 0.0, 1.0, 0.01);
 
     obs_property_t *lens =
         obs_properties_add_list(props, kCamLens, "Lens", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-    for (const char *l : {"0.5x", "1x", "2x", "3x", "5x"})
-        obs_property_list_add_string(lens, l, l);
-
     obs_property_t *fps =
         obs_properties_add_list(props, kCamFPS, "FPS", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    for (int f : {24, 25, 30, 50, 60})
-        obs_property_list_add_int(fps, std::to_string(f).c_str(), f);
+    {
+        // Populate from THIS phone's device-read option lists (Refresh / reopen after connecting);
+        // fall back to the standard ladders when no state has arrived yet.
+        std::vector<std::string> lenses;
+        std::vector<int> fpsList;
+        if (ctx) {
+            std::lock_guard<std::mutex> lk(ctx->stateMutex);
+            lenses = ctx->capLenses;
+            fpsList = ctx->capFps;
+        }
+        if (lenses.empty()) lenses = {"0.5x", "1x", "2x", "3x", "5x"};
+        if (fpsList.empty()) fpsList = {24, 25, 30, 50, 60};
+        for (const auto &l : lenses) obs_property_list_add_string(lens, l.c_str(), l.c_str());
+        for (int f : fpsList) obs_property_list_add_int(fps, std::to_string(f).c_str(), f);
+    }
 
     obs_properties_add_float_slider(props, kCamZoom, "Zoom", 1.0, 15.0, 0.1);
     obs_properties_add_bool(props, kCamLUT, "LUT on");
+
+    // Reflect the camera's ACTUAL current state in the control widgets — so the lens combo,
+    // ISO, shutter, WB, fps and the auto toggles open at what the phone is really doing instead
+    // of a static saved default ("линза по умолчанию не та что выбрана"). The received state
+    // already feeds the read-only status text; THIS feeds it into the editable widgets. Safe to
+    // run on every get_properties: OBS only calls get_properties on dialog OPEN or a worker-issued
+    // reload (never on a widget edit — see refresh_clicked / onControl), so it can't clobber an
+    // in-flight edit. The send-cache (ctx->c*) is synced too, so seeding never looks like an
+    // operator change in source_update → no command is bounced back.
+    if (ctx) {
+        std::string aLens;
+        double aIso = 0, aSh = 0, aWb = 0;
+        int aFps = 0;
+        bool aAE = true, aAWB = true, have = false;
+        {
+            std::lock_guard<std::mutex> lk(ctx->stateMutex);
+            have = !ctx->rLens.empty() || ctx->rIso > 0; // a real snapshot has arrived
+            aLens = ctx->rLens; aIso = ctx->rIso; aSh = ctx->rShutter; aWb = ctx->rWB;
+            aFps = ctx->rFps; aAE = ctx->rAE; aAWB = ctx->rAWB;
+        }
+        if (have) {
+            obs_data_t *st = obs_source_get_settings(ctx->source);
+            if (!aLens.empty()) { obs_data_set_string(st, kCamLens, aLens.c_str()); ctx->cLens = aLens; }
+            if (aIso > 0)       { obs_data_set_int(st, kCamISO, int(aIso + 0.5));    ctx->cISO = int(aIso + 0.5); }
+            if (aSh > 0)        { obs_data_set_int(st, kCamShutter, int(aSh + 0.5)); ctx->cShutter = int(aSh + 0.5); }
+            if (aWb > 0)        { obs_data_set_int(st, kCamWB, int(aWb + 0.5));      ctx->cWB = int(aWb + 0.5); }
+            if (aFps > 0)       { obs_data_set_int(st, kCamFPS, aFps);               ctx->cFPS = aFps; }
+            obs_data_set_bool(st, kCamAE, aAE);   ctx->cAE = aAE;
+            obs_data_set_bool(st, kCamAWB, aAWB); ctx->cAWB = aAWB;
+            obs_data_release(st);
+        }
+    }
 
     // Auto toggles drive the grey-out of their manual partners — live (callback)
     // and on open (seed from the last-known auto state in ctx).
