@@ -72,7 +72,9 @@ constexpr const char *kCamFPS = "cam_fps";
 constexpr const char *kCamZoom = "cam_zoom";
 constexpr const char *kCamLUT = "cam_lut";
 
-constexpr int kDefaultDelayMs = 120; // Studio-style fixed delay (Normal preset)
+constexpr int kDefaultDelayMs = 60; // LAN default (~2 frames @30fps). Our no-B-frame stream on a LAN
+                                    // has far less jitter than the 120ms SRT/WAN figure; presets
+                                    // 0/120/200/400 still let a bad-network operator dial back up.
 constexpr int kMaxDelayMs = 400;     // matches the highest preset (Safe)
 constexpr size_t kSafetyCapFrames = 600; // anti-runaway if timestamps stop advancing
 
@@ -497,6 +499,14 @@ void onDecodedFrame(AirliveSourceCtx *ctx, const AVFrame *f, int64_t pts_us) {
     ctx->dq.pop_front();
     outputFrame(ctx, out.frame, out.pts_us);
     av_frame_free(&out.frame);
+
+    // Re-enter "filling" once the buffer falls below the target span — otherwise a forward gap that
+    // drains the queue (reconverge above, or a stall) leaves delayReached stuck true, so the FIFO
+    // emits one-in/one-out at ~0 depth and the operator's chosen jitter buffer silently collapses
+    // for the rest of the session. Resetting lets the next frames rebuild the delay-worth span.
+    if (ctx->dq.empty() ||
+        (ctx->dq.back().pts_us - ctx->dq.front().pts_us) < intervalUs)
+        ctx->delayReached = false;
 }
 
 // ---- tally (Studio Mode -> setCue) ----------------------------------------
@@ -843,6 +853,11 @@ void *createWithRole(obs_data_t *settings, obs_source_t *source, const char *rol
     auto *ctx = new AirliveSourceCtx();
     ctx->source = source;
     ctx->role = role;
+    // Drop libobs's OWN async-frame FIFO (timestamp-paced playout) that otherwise stacks ~1 capture
+    // frame + up to ~1 compositor tick ON TOP of our delay FIFO. Unbuffered = libobs drains to the
+    // newest frame each composite tick, so our delay_ms FIFO is the SINGLE place latency is added and
+    // "Unbuffered (+0 ms)" finally means 0. Our presets remain the jitter buffer for bad networks.
+    obs_source_set_async_unbuffered(source, true);
     ctx->did = loadOrCreateDid();
     apply_settings(ctx, settings);
     applyCameraControls(ctx, settings, /*sendDiffs=*/false); // seed cache, don't command
@@ -1034,8 +1049,9 @@ obs_properties_t *source_get_properties(void *data) {
     obs_property_t *delay = obs_properties_add_list(props, kSettingDelayMs,
                                                     obs_module_text("Airlive.Delay"),
                                                     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    obs_property_list_add_int(delay, "Unbuffered (+0 ms)", 0);  // OBS async_unbuffered / WebRTC min=0
-    obs_property_list_add_int(delay, "Normal (+120 ms)", 120);  // SRT default jitter buffer
+    obs_property_list_add_int(delay, "Unbuffered (+0 ms)", 0);  // libobs unbuffered / WebRTC min=0
+    obs_property_list_add_int(delay, "LAN (+60 ms)", 60);       // DEFAULT — kDefaultDelayMs (~2 frames)
+    obs_property_list_add_int(delay, "Normal (+120 ms)", 120);  // SRT default jitter buffer / WAN
     obs_property_list_add_int(delay, "Smooth (+200 ms)", 200);  // WebRTC interactive upper bound
     obs_property_list_add_int(delay, "Safe (+400 ms)", 400);    // WebRTC buffer-against-glitches
     obs_property_set_long_description(
@@ -1088,10 +1104,16 @@ obs_properties_t *source_get_properties(void *data) {
             wbMin  = ctx->capWbMin; wbMax = ctx->capWbMax;
             tMin   = ctx->capTintMin; tMax = ctx->capTintMax;
         }
-        obs_property_int_set_limits(iso,     int(isoMin), int(isoMax), 1);
-        obs_property_int_set_limits(shutter, int(shMin),  int(shMax),  1);
-        obs_property_int_set_limits(wb,      int(wbMin),  int(wbMax),  50);
-        obs_property_int_set_limits(tint,    int(tMin),   int(tMax),   1);
+        // Clamp lo<=hi: a partial/hostile capabilities object can supply one bound while its pair
+        // falls back to a default (e.g. isoMin=5000 with isoMax=3200 default), which would set an
+        // INVERTED, unusable slider limit. min/max keeps it sane no matter what the sender sends.
+        auto setLim = [](obs_property_t *p, double a, double b, int step) {
+            obs_property_int_set_limits(p, int(a < b ? a : b), int(a < b ? b : a), step);
+        };
+        setLim(iso,     isoMin, isoMax, 1);
+        setLim(shutter, shMin,  shMax,  1);
+        setLim(wb,      wbMin,  wbMax,  50);
+        setLim(tint,    tMin,   tMax,   1);
     }
 
     obs_property_t *af = obs_properties_add_bool(props, kCamAF, "Auto focus");
@@ -1130,6 +1152,7 @@ obs_properties_t *source_get_properties(void *data) {
     // operator change in source_update → no command is bounced back.
     if (ctx) {
         std::string aLens;
+        std::vector<std::string> capL;
         double aIso = 0, aSh = 0, aWb = 0;
         int aFps = 0;
         bool aAE = true, aAWB = true, have = false;
@@ -1138,16 +1161,36 @@ obs_properties_t *source_get_properties(void *data) {
             have = !ctx->rLens.empty() || ctx->rIso > 0; // a real snapshot has arrived
             aLens = ctx->rLens; aIso = ctx->rIso; aSh = ctx->rShutter; aWb = ctx->rWB;
             aFps = ctx->rFps; aAE = ctx->rAE; aAWB = ctx->rAWB;
+            capL = ctx->capLenses;
         }
         if (have) {
+            // Only seed the lens if the camera's current lens is actually SELECTABLE in the combo
+            // (the device list, else the fallback ladder). Seeding an unlisted lens — e.g. the front
+            // camera's "Front", which isn't in the back-lens availableLenses — makes the combo snap to
+            // index 0 and then bounce the phone to that wrong lens on the next apply.
+            const std::vector<std::string> lensList =
+                capL.empty() ? std::vector<std::string>{"0.5x", "1x", "2x", "3x", "5x"} : capL;
+            bool lensSelectable = false;
+            for (const auto &l : lensList)
+                if (l == aLens) { lensSelectable = true; break; }
+
+            // Write each setting ONLY when it differs from what's stored, so merely opening the
+            // dialog never dirties / overwrites the saved scene-collection settings when the camera
+            // already matches. The send-cache (ctx->c*) is always synced to the actual so a later
+            // source_update never sends a spurious command.
             obs_data_t *st = obs_source_get_settings(ctx->source);
-            if (!aLens.empty()) { obs_data_set_string(st, kCamLens, aLens.c_str()); ctx->cLens = aLens; }
-            if (aIso > 0)       { obs_data_set_int(st, kCamISO, int(aIso + 0.5));    ctx->cISO = int(aIso + 0.5); }
-            if (aSh > 0)        { obs_data_set_int(st, kCamShutter, int(aSh + 0.5)); ctx->cShutter = int(aSh + 0.5); }
-            if (aWb > 0)        { obs_data_set_int(st, kCamWB, int(aWb + 0.5));      ctx->cWB = int(aWb + 0.5); }
-            if (aFps > 0)       { obs_data_set_int(st, kCamFPS, aFps);               ctx->cFPS = aFps; }
-            obs_data_set_bool(st, kCamAE, aAE);   ctx->cAE = aAE;
-            obs_data_set_bool(st, kCamAWB, aAWB); ctx->cAWB = aAWB;
+            const int iiso = int(aIso + 0.5), ish = int(aSh + 0.5), iwb = int(aWb + 0.5);
+            if (!aLens.empty() && lensSelectable) {
+                if (aLens != obs_data_get_string(st, kCamLens)) obs_data_set_string(st, kCamLens, aLens.c_str());
+                ctx->cLens = aLens;
+            }
+            if (aIso > 0) { if (iiso != obs_data_get_int(st, kCamISO))     obs_data_set_int(st, kCamISO, iiso);     ctx->cISO = iiso; }
+            if (aSh > 0)  { if (ish  != obs_data_get_int(st, kCamShutter)) obs_data_set_int(st, kCamShutter, ish);  ctx->cShutter = ish; }
+            if (aWb > 0)  { if (iwb  != obs_data_get_int(st, kCamWB))      obs_data_set_int(st, kCamWB, iwb);       ctx->cWB = iwb; }
+            if (aFps > 0) { if (aFps != int(obs_data_get_int(st, kCamFPS))) obs_data_set_int(st, kCamFPS, aFps);    ctx->cFPS = aFps; }
+            if (aAE  != obs_data_get_bool(st, kCamAE))  obs_data_set_bool(st, kCamAE, aAE);
+            if (aAWB != obs_data_get_bool(st, kCamAWB)) obs_data_set_bool(st, kCamAWB, aAWB);
+            ctx->cAE = aAE; ctx->cAWB = aAWB;
             obs_data_release(st);
         }
     }

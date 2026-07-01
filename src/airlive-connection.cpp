@@ -198,6 +198,22 @@ void AirliveConnection::run() {
 #elif defined(TCP_KEEPIDLE)
         setsockopt(client, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));  // Linux
 #endif
+        // Probe interval + count so a dead peer is detected in ~15-25s, not the ~10 min OS default.
+        // This matters MORE now that a control-only camera (videoActive=false) is exempt from the 8s
+        // app-layer stall reaper — keepalive is then the ONLY thing that frees the slot if it dies.
+        int kaIntvl = 5, kaCnt = 3;
+#if defined(TCP_KEEPINTVL)
+        setsockopt(client, IPPROTO_TCP, TCP_KEEPINTVL, &kaIntvl, sizeof(kaIntvl));
+#endif
+#if defined(TCP_KEEPCNT)
+        setsockopt(client, IPPROTO_TCP, TCP_KEEPCNT, &kaCnt, sizeof(kaCnt));
+#endif
+        // Nagle OFF. Inbound camera->OBS video is one-way bulk (Nagle on the receiver never delays
+        // it), but everything OBS SENDS BACK on this socket — the auth handshake + tally setCue cues
+        // — is a lone small write that Nagle + delayed-ACK can sit on for ~40ms. Camera (noDelay=true)
+        // and Bridge (tcp.noDelay=true) already disable it; make all three ends consistent.
+        int nodelay = 1;
+        setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
         {
             std::lock_guard<std::mutex> lk(sendMutex_);
             clientFd_ = client;
@@ -243,11 +259,18 @@ void AirliveConnection::serveClient(socket_t client, const std::string &peerKey)
     // unauthenticated peer never got this far, so it never held the channel.
     connected_ = true;
     bonjour_.setBusy(true);
+    peerVideoActive_.store(true); // assume video until a control-only snapshot says otherwise
+
+    // Mirror the Bridge: tell the phone to enable its encoder. Without this a phone left STICKY in
+    // control-only mode (encoder off) is permanently video-dead in OBS. setEncoderEnabled is
+    // idempotent, so a phone already in video+control just re-confirms. Enqueued — drained below.
+    sendControl("{\"type\":\"setDeliveryMode\",\"stringValue\":\"videoAndControl\"}");
 
     std::vector<uint8_t> chunk(kRecvChunk);
     int idleMs = 0; // time since the last byte — resets on every recv
 
     while (running_.load()) {
+        drainOutgoing(); // flush queued tally / delivery-mode on the worker thread (never inline)
         poll_fd_t pfd{};
         pfd.fd = client;
         pfd.events = POLLIN;
@@ -258,7 +281,10 @@ void AirliveConnection::serveClient(socket_t client, const std::string &peerKey)
             // No data this interval. A live feed never goes quiet for long, so a
             // sustained silence means the peer vanished without a FIN.
             idleMs += kPollTimeoutMs;
-            if (idleMs >= kStallTimeoutMs) {
+            // Only reap on silence if the phone is actively sending VIDEO. A control-only camera
+            // (videoActive=false) legitimately sends nothing for long stretches — reaping it here
+            // caused a disconnect loop. TCP keepalive (set on accept) still catches a truly dead peer.
+            if (idleMs >= kStallTimeoutMs && peerVideoActive_.load()) {
                 blog(LOG_INFO, "[airlive] no data for %d ms — assuming iPhone gone", idleMs);
                 return;
             }
@@ -292,12 +318,23 @@ void AirliveConnection::serveClient(socket_t client, const std::string &peerKey)
                 decoder_.setParameterSets(pkt.payload, pkt.payload_len);
                 break;
             case PacketType::Sample:
+                peerVideoActive_.store(true); // a sample IS video — re-arm the stall reaper
                 decoder_.decodeSample(pkt.payload, pkt.payload_len, pkt.timestamp_us);
                 break;
             case PacketType::Control:
                 // The iPhone sends a JSON state snapshot here on connect and
                 // after camera-side changes. We surface it for status display;
                 // sending set-commands back (tally) is the only write we do.
+                // Track videoActive so the stall reaper exempts a control-only camera. Lightweight
+                // substring scan of the JSON (Swift JSONEncoder emits no spaces around ':'); absent
+                // key (older camera) leaves the prior value, defaulting to true = reaper armed.
+                if (pkt.payload_len) {
+                    const std::string s(reinterpret_cast<const char *>(pkt.payload), pkt.payload_len);
+                    if (s.find("\"videoActive\":false") != std::string::npos)
+                        peerVideoActive_.store(false);
+                    else if (s.find("\"videoActive\":true") != std::string::npos)
+                        peerVideoActive_.store(true);
+                }
                 if (controlSink_)
                     controlSink_(reinterpret_cast<const char *>(pkt.payload), pkt.payload_len);
                 break;
@@ -437,6 +474,19 @@ bool AirliveConnection::isBanned(const std::string &peerKey) const {
 }
 
 void AirliveConnection::registerAuthFailure(const std::string &peerKey) {
+    // Bound the ledger. It's only pruned on a successful auth (clearBan), so a spoofed-source flood
+    // of many distinct IPs each failing once would grow it for the whole OBS session. When it gets
+    // large, drop entries whose ban has already expired (banUntilMs <= now, incl. sub-threshold
+    // failures with banUntilMs==0) — never a currently-active ban, never the peer being recorded now.
+    if (authBans_.size() > 256) {
+        const int64_t now = nowMs();
+        for (auto it = authBans_.begin(); it != authBans_.end();) {
+            if (it->first != peerKey && it->second.second <= now)
+                it = authBans_.erase(it);
+            else
+                ++it;
+        }
+    }
     auto &entry = authBans_[peerKey]; // {failures, banUntilMs}
     entry.first += 1;
     if (entry.first >= kAuthMaxFailures) {
@@ -459,8 +509,32 @@ void AirliveConnection::setAuth(bool require, std::string password) {
 }
 
 bool AirliveConnection::sendControl(const std::string &json) {
-    return sendRaw(PacketType::Control,
-                   reinterpret_cast<const uint8_t *>(json.data()), json.size());
+    // ENQUEUE only — never send inline. sendControl is reachable from the OBS render/video thread
+    // (ensureTally via source_activate/deactivate/show/hide), and sendRaw can block up to its budget
+    // on a half-dead peer; blocking there freezes the compositor on scene switches. The worker thread
+    // drains this (drainOutgoing) between polls. Tally/mode are self-healing (re-asserted ~1 Hz and on
+    // reconnect), so a deferred or teardown-dropped cue is harmless. Bounded to avoid unbounded growth.
+    std::lock_guard<std::mutex> lk(outMutex_);
+    if (outControl_.size() >= 64)
+        outControl_.erase(outControl_.begin()); // drop oldest — newest cue supersedes it anyway
+    outControl_.push_back(json);
+    return true;
+}
+
+// Worker-thread only: flush everything sendControl queued. sendRaw may block here (worker thread),
+// which is fine — the render/UI thread already returned from sendControl without waiting.
+void AirliveConnection::drainOutgoing() {
+    std::vector<std::string> pending;
+    {
+        std::lock_guard<std::mutex> lk(outMutex_);
+        pending.swap(outControl_);
+    }
+    for (const auto &json : pending)
+        // Stop on the first failure: a false means the peer is gone/wedged, and each further sendRaw
+        // could burn its full send budget too — draining 64 of them would stall the worker (and delay
+        // the stall reaper) for many seconds. Control is self-healing, so dropping the rest is safe.
+        if (!sendRaw(PacketType::Control, reinterpret_cast<const uint8_t *>(json.data()), json.size()))
+            break;
 }
 
 bool AirliveConnection::sendRaw(PacketType type, const uint8_t *payload, size_t len) {

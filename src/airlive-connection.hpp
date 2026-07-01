@@ -20,6 +20,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "bonjour-service.hpp"
 #include "h264-decoder.hpp"
@@ -74,8 +75,14 @@ private:
                           const std::string &password);
 
     // Frame + send any packet type back to the iPhone (the generic primitive
-    // behind sendControl and the auth packets).  Thread-safe.
+    // behind sendControl and the auth packets).  Thread-safe.  BLOCKS up to a send
+    // budget on a wedged peer — must run on the WORKER thread only (auth handshake
+    // + drainOutgoing), never on an OBS render/UI thread (see sendControl).
     bool sendRaw(PacketType type, const uint8_t *payload, size_t len);
+
+    // Flush queued control packets (enqueued by sendControl from any thread) on the
+    // worker thread.  Called each serveClient loop iteration.
+    void drainOutgoing();
 
     // Frame + send an AuthResult JSON packet over the live client fd.
     void sendAuthResult(bool ok, const char *reason = nullptr);
@@ -100,6 +107,17 @@ private:
     // writes to a fd the worker thread is closing.
     std::mutex sendMutex_;
     socket_t clientFd_{kInvalidSocket};
+
+    // Outgoing control packets are ENQUEUED here by sendControl (callable from the OBS render/UI
+    // thread) and drained on the worker thread — so a blocking send on a half-dead peer can never
+    // freeze the compositor. Bounded; tally/mode are self-healing so dropping the oldest is safe.
+    std::mutex outMutex_;
+    std::vector<std::string> outControl_;
+
+    // The phone's last-reported video-active state (from its control-JSON snapshot / any sample).
+    // False for a control-only camera → exempt it from the sample-stall reaper (TCP keepalive still
+    // catches a truly dead peer).  Written on the worker thread, read there too.
+    std::atomic<bool> peerVideoActive_{true};
 
     // Auth config — written from the OBS UI thread, read by the worker.  Guarded
     // by authMutex_; the worker snapshots it once per connection.
