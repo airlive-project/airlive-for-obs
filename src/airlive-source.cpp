@@ -78,6 +78,19 @@ constexpr int kDefaultDelayMs = 60; // LAN default (~2 frames @30fps). Our no-B-
 constexpr int kMaxDelayMs = 400;     // matches the highest preset (Safe)
 constexpr size_t kSafetyCapFrames = 600; // anti-runaway if timestamps stop advancing
 
+// No decoded frame for this long ⇒ paint black. The on-air source lost signal, dropped, or the
+// Bridge deliberately cut its program to black (it just stops forwarding). Long enough to ride out
+// a single dropped frame / keyframe gap at 30 fps, short enough to feel like a deliberate cut.
+constexpr int64_t kNoSignalBlackNs = 600'000'000; // 600 ms
+
+// Monotonic wall-clock in ns — for stall detection only (NOT frame timestamps, which stay on the
+// capture PTS timeline). steady_clock never jumps backwards on an NTP step.
+inline int64_t nowMonoNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 // A decoded frame held in the delay FIFO — an FFmpeg ref-counted clone (cheap,
 // refs the buffer, no pixel copy) tagged with its capture PTS.
 struct QueuedFrame {
@@ -150,6 +163,19 @@ struct AirliveSourceCtx {
     // Set by the "Refresh" button (UI thread); consumed by onControl (worker thread) to issue the
     // actual obs_source_update_properties() — a property callback can't reload inline without UAF.
     std::atomic<bool> refreshRequested{false};
+
+    // Set false at the very top of source_destroy so no thread pokes the OBS UI once teardown
+    // has begun — see the CRASH note on obs_source_update_properties in source_video_tick.
+    std::atomic<bool> alive{true};
+
+    // No-signal→black + live status, driven from video_tick. The two atomics are written on the
+    // worker thread (real frame emit) and read on the video thread; the plain fields below are
+    // touched ONLY in video_tick (single owner, no locks).
+    std::atomic<int64_t> lastFrameMonoNs{0};  // nowMonoNs() of the last REAL emitted frame (0 = none yet)
+    std::atomic<uint64_t> lastEmittedTsNs{0}; // last frame.timestamp handed to OBS (black continues it)
+    bool tickBlanked = false;                 // a black frame is currently shown (emit once per gap)
+    std::vector<uint8_t> blackBuf;            // reusable black I420 (built lazily, rebuilt on resize)
+    int blackW = 0, blackH = 0;               // dims blackBuf currently holds
 
     // Camera-control last-sent values: used to (a) detect which control the
     // operator actually changed in update(), and (b) seed the auto/manual
@@ -354,6 +380,8 @@ void outputRotated(AirliveSourceCtx *ctx, const AVFrame *f, int64_t pts_us, int 
     video_format_get_parameters_for_format(cs, range, frame.format, frame.color_matrix,
                                            frame.color_range_min, frame.color_range_max);
     obs_source_output_video2(ctx->source, &frame);
+    ctx->lastFrameMonoNs.store(nowMonoNs());     // video_tick no-signal detection
+    ctx->lastEmittedTsNs.store(frame.timestamp); // keep any black frame on this same timeline
 }
 
 // Map a decoded AVFrame and hand it to OBS. Runs on the worker thread only.
@@ -424,6 +452,8 @@ void outputFrame(AirliveSourceCtx *ctx, const AVFrame *f, int64_t pts_us) {
                                            frame.color_range_min, frame.color_range_max);
 
     obs_source_output_video2(ctx->source, &frame);
+    ctx->lastFrameMonoNs.store(nowMonoNs());     // video_tick no-signal detection
+    ctx->lastEmittedTsNs.store(frame.timestamp); // keep any black frame on this same timeline
 }
 
 // ---- fixed-delay FIFO ------------------------------------------------------
@@ -672,7 +702,8 @@ void onControl(AirliveSourceCtx *ctx, const char *json, size_t len) {
         // worker thread, NOT a property callback: from the UI thread the signal handler re-enters and
         // frees the live widgets mid-callback (UAF). Off-thread the frontend queues the reload safely.
         // No-op when no dialog is open. Also serves the manual "Refresh" button (sets refreshRequested).
-        if (discreteChanged || ctx->refreshRequested.exchange(false))
+        // `alive` gate: never poke the UI once teardown started (see the crash note in video_tick).
+        if (ctx->alive.load() && (discreteChanged || ctx->refreshRequested.exchange(false)))
             obs_source_update_properties(ctx->source);
         // Additive presentation rotation (clockwise; absent/0 = landscape).
         ctx->rotationDeg.store(normalizeRotation(int(obs_data_get_int(st, "outputRotation"))));
@@ -833,7 +864,9 @@ void apply_settings(AirliveSourceCtx *ctx, obs_data_t *settings) {
         obs_data_set_string(settings, kSettingSourceName, ctx->src.c_str());
     }
 
-    int delay = int(obs_data_get_int(settings, kSettingDelayMs));
+    // The Bridge-program source adds NO delay — the Bridge already switched and timed the program,
+    // so it flies straight through (no operator delay control on that source, see get_properties).
+    int delay = (ctx->role == "obs-bridge") ? 0 : int(obs_data_get_int(settings, kSettingDelayMs));
     delay = delay < 0 ? 0 : (delay > kMaxDelayMs ? kMaxDelayMs : delay);
     if (delay != ctx->delayMs.exchange(delay))
         ctx->delayReset.store(true); // re-converge the FIFO to the new target
@@ -871,15 +904,16 @@ void *source_create(obs_data_t *settings, obs_source_t *source) {
     return createWithRole(settings, source, "obs");
 }
 
-// "OBS Airlive Bridge" — receives the PROGRAM from the Airlive Bridge app.  A
-// SEPARATE source (distinct Bonjour role) so it can run alongside a direct iPhone
-// source without competing for the same slot.
+// "OBS Airlive Bridge" — receives the PROGRAM from the Airlive Bridge app over a
+// same-machine loopback link (127.0.0.1, no Bonjour, invisible to the iPhone).  A
+// SEPARATE source from the direct-iPhone one so both can run at once.
 void *source_create_bridge(obs_data_t *settings, obs_source_t *source) {
     return createWithRole(settings, source, "obs-bridge");
 }
 
 void source_destroy(void *data) {
     auto *ctx = static_cast<AirliveSourceCtx *>(data);
+    ctx->alive.store(false); // stop any UI poke from a still-draining callback (crash guard)
     ctx->conn.reset();    // joins worker — nothing touches the FIFO after this
     flushDelayQueue(ctx); // free any frames still buffered
     delete ctx;
@@ -928,7 +962,9 @@ void source_hide(void *data) { ensureTally(static_cast<AirliveSourceCtx *>(data)
 std::string buildStatusText(AirliveSourceCtx *ctx) {
     std::string s;
     const bool conn = ctx->conn && ctx->conn->connected();
-    s += conn ? "● Connected" : "○ Waiting for iPhone…";
+    const bool bridge = (ctx->role == "obs-bridge");
+    s += conn ? (bridge ? "● Receiving program from Airlive Bridge" : "● Connected")
+              : (bridge ? "○ Waiting for Airlive Bridge…" : "○ Waiting for iPhone…");
 
     if (conn) {
         const uint32_t w = ctx->statW.load(), h = ctx->statH.load();
@@ -1041,6 +1077,13 @@ obs_properties_t *source_get_properties(void *data) {
         obs_properties_add_button2(props, "refresh", obs_module_text("Airlive.Refresh"),
                                    refresh_clicked, ctx);
     }
+
+    // The Bridge-program source has NO operator settings — it only RECEIVES the already-switched,
+    // already-timed program from the Airlive Bridge app. No fixed delay (program flies straight
+    // through), no iPhone-facing device/source name (it's not a camera target), no per-camera control,
+    // no password. Just the status readout above; rename it in OBS's own Sources list.
+    if (ctx && ctx->role == "obs-bridge")
+        return props;
 
     // Fixed-delay presets — mirror the Studio app's LatencyPreset values 1:1
     // (real industry standards, not round numbers). A discrete list (not a
@@ -1212,6 +1255,74 @@ obs_properties_t *source_get_properties(void *data) {
 
 // Shared builder for both source types — identical except id / display name /
 // create (which sets the Bonjour role).
+// Paint one opaque-black I420 frame at w×h. Full-range Y=0 / U=V=128 = pure black. The buffer is
+// reused across ticks and rebuilt only on a resize. Timestamp continues the emitted timeline so the
+// async source treats black as the NEWEST frame (holds it), and the first real frame on resume — with
+// its own advancing capture PTS — still supersedes it. Emitted at most ONCE per stall (tickBlanked),
+// so lastEmittedTsNs only advances +33 ms per gap; a resumed capture PTS is normally far larger and
+// wins. Only theoretical exception (never seen): a multi-minute stall AND an upstream PTS reset to ~0
+// on reconnect could let this synthetic ts outrun the fresh PTS for one frame. video_tick thread only.
+void emitBlack(AirliveSourceCtx *ctx, uint32_t w, uint32_t h) {
+    const uint32_t cw = (w + 1) / 2, chh = (h + 1) / 2;
+    const size_t ySize = size_t(w) * h, cSize = size_t(cw) * chh;
+    if (ctx->blackW != int(w) || ctx->blackH != int(h) || ctx->blackBuf.size() != ySize + 2 * cSize) {
+        ctx->blackBuf.assign(ySize + 2 * cSize, 0);
+        memset(ctx->blackBuf.data() + ySize, 128, 2 * cSize); // Y stays 0, chroma neutral
+        ctx->blackW = int(w);
+        ctx->blackH = int(h);
+    }
+    uint8_t *y = ctx->blackBuf.data();
+    obs_source_frame2 frame = {};
+    frame.width = w;
+    frame.height = h;
+    frame.timestamp = ctx->lastEmittedTsNs.load() + 33'000'000ull; // +~1 frame @30
+    ctx->lastEmittedTsNs.store(frame.timestamp);
+    frame.format = VIDEO_FORMAT_I420;
+    frame.data[0] = y;             frame.linesize[0] = w;
+    frame.data[1] = y + ySize;     frame.linesize[1] = cw;
+    frame.data[2] = y + ySize + cSize; frame.linesize[2] = cw;
+    frame.range = VIDEO_RANGE_FULL;
+    frame.trc = VIDEO_TRC_DEFAULT;
+    video_format_get_parameters_for_format(VIDEO_CS_DEFAULT, VIDEO_RANGE_FULL, frame.format,
+                                           frame.color_matrix, frame.color_range_min,
+                                           frame.color_range_max);
+    obs_source_output_video2(ctx->source, &frame);
+}
+
+// Runs every OBS video frame (video thread, NOT the UI thread). Two jobs:
+//  1. Live status — reload an OPEN Properties dialog when the connection flips (Waiting↔Receiving)
+//     or on an explicit Refresh. For the Bridge source this is the ONLY status driver: it sends no
+//     state messages, so onControl (the camera source's reload path) never fires. Safe off the UI
+//     thread, exactly like the onControl reload.
+//  2. No-signal → BLACK — when decoded frames stop (source dropped, on-air camera lost signal, or the
+//     Bridge cut its program to black by just not forwarding), paint black so OBS shows a clean feed
+//     instead of freezing on the last picture. Emitted once per gap; cleared when real frames resume.
+void source_video_tick(void *data, float /*seconds*/) {
+    auto *ctx = static_cast<AirliveSourceCtx *>(data);
+    if (!ctx || !ctx->alive.load())
+        return;
+
+    // ⚠️ CRASH — reload the Properties panel ONLY on an explicit Refresh click, never automatically.
+    // obs_source_update_properties() rebuilds the panel on the UI thread (and buildStatusText reads
+    // the Keychain); if that fires while OBS is showing a modal (e.g. deleting this source), macOS 26
+    // re-enters SwiftUI/CoreUI's one-time systemAssetManager init and SEGVs OBS — a 100%-repro crash
+    // on removing the Bridge source. The status text still refreshes on panel-open and on Refresh.
+    if (ctx->refreshRequested.exchange(false))
+        obs_source_update_properties(ctx->source);
+
+    const uint32_t w = ctx->statW.load(), h = ctx->statH.load();
+    if (!w || !h)
+        return; // never received a frame → OBS already shows its default (black) with nothing to size
+    const int64_t last = ctx->lastFrameMonoNs.load();
+    const bool stalled = last != 0 && (nowMonoNs() - last) > kNoSignalBlackNs;
+    if (stalled && !ctx->tickBlanked) {
+        emitBlack(ctx, w, h);
+        ctx->tickBlanked = true;
+    } else if (!stalled && ctx->tickBlanked) {
+        ctx->tickBlanked = false; // real frames are flowing again
+    }
+}
+
 struct obs_source_info makeSourceInfo(const char *id,
                                       const char *(*getName)(void *),
                                       void *(*create)(obs_data_t *, obs_source_t *)) {
@@ -1228,6 +1339,7 @@ struct obs_source_info makeSourceInfo(const char *id,
     info.create = create;
     info.destroy = source_destroy;
     info.update = source_update;
+    info.video_tick = source_video_tick; // live status reload + no-signal→black
     info.get_defaults = source_get_defaults;
     info.get_properties = source_get_properties;
     info.activate = source_activate;

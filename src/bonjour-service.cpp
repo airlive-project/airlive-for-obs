@@ -44,9 +44,12 @@ bool BonjourService::start(uint16_t port, const ServiceIdentity &id) {
 
     // Port must be network byte order. name=NULL → use the host name; the phone
     // identifies us by the TXT record, not the service instance name.
+    // Only the direct-camera source ever gets here (the Bridge-program source is a same-machine
+    // loopback link and never starts Bonjour), so the type is always "_airlive._tcp".
+    const char *regtype = "_airlive._tcp";
     DNSServiceRef sdref = nullptr;
     const DNSServiceErrorType err = DNSServiceRegister(
-        &sdref, 0, 0, /*name*/ nullptr, "_airlive._tcp", /*domain*/ nullptr,
+        &sdref, 0, 0, /*name*/ nullptr, regtype, /*domain*/ nullptr,
         /*host*/ nullptr, htons(port), TXTRecordGetLength(&txt),
         TXTRecordGetBytesPtr(&txt), onRegister, this);
 

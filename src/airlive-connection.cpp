@@ -19,6 +19,12 @@ namespace {
 constexpr int kPollTimeoutMs = 250;
 constexpr size_t kRecvChunk = 64 * 1024;
 
+// The "OBS Airlive Bridge" source and the Airlive Bridge app run on the SAME Mac, so their link is
+// a plain loopback socket on this fixed port — NO Bonjour, NO LAN exposure (so the iPhone never sees
+// it and no local-network permission is involved). The Bridge app connects to 127.0.0.1:this port.
+// Must match kBridgeLocalPort in airlive-bridge/Sources/Output/AirliveRelayOutput.swift.
+constexpr uint16_t kBridgeLocalPort = 47788;
+
 // A live feed delivers frames continuously. If no bytes arrive for this long,
 // the peer is gone — even if it never sent a TCP FIN (app backgrounded, Wi-Fi
 // dropped, walked out of range). Reaping the dead socket frees the single slot
@@ -92,6 +98,37 @@ void AirliveConnection::stop() {
 // dual-stack iPhone reaches us over either IPv4 or IPv6). Returns the chosen
 // port via outPort, or kInvalidSocket on failure.
 socket_t AirliveConnection::openListenSocket(uint16_t &outPort) {
+    // Bridge-program source: same-machine link → bind IPv4 LOOPBACK on a FIXED port. Not reachable
+    // from the LAN (iPhone can't see it, no Bonjour, no local-network permission), and the Bridge app
+    // connects straight to 127.0.0.1:kBridgeLocalPort.
+    if (identity_.role == "obs-bridge") {
+        socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd == kInvalidSocket) {
+            blog(LOG_ERROR, "[airlive] socket() failed (bridge)");
+            return kInvalidSocket;
+        }
+        int yes = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&yes), sizeof(yes));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1 only
+        addr.sin_port = htons(kBridgeLocalPort);
+        if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+            blog(LOG_ERROR, "[airlive] bind() 127.0.0.1:%u failed — is another OBS Airlive Bridge source running?",
+                 kBridgeLocalPort);
+            close_socket(fd);
+            return kInvalidSocket;
+        }
+        if (::listen(fd, 1) != 0) {
+            blog(LOG_ERROR, "[airlive] listen() failed (bridge)");
+            close_socket(fd);
+            return kInvalidSocket;
+        }
+        outPort = kBridgeLocalPort;
+        setNonBlocking(fd);
+        return fd;
+    }
+
     socket_t fd = ::socket(AF_INET6, SOCK_STREAM, 0);
     if (fd == kInvalidSocket) {
         blog(LOG_ERROR, "[airlive] socket() failed");
@@ -142,8 +179,13 @@ void AirliveConnection::run() {
         return;
     }
 
-    blog(LOG_INFO, "[airlive] listening on ephemeral port %u", port);
-    bonjour_.start(port, identity_);
+    if (identity_.role == "obs-bridge") {
+        // Same-machine loopback link — no Bonjour advert at all (the Bridge app connects directly).
+        blog(LOG_INFO, "[airlive] OBS Airlive Bridge source listening on 127.0.0.1:%u (loopback, no Bonjour)", port);
+    } else {
+        blog(LOG_INFO, "[airlive] listening on ephemeral port %u", port);
+        bonjour_.start(port, identity_);
+    }
 
     while (running_.load()) {
         // Poll the listen socket and, when present, the dns_sd socket so the
@@ -182,7 +224,8 @@ void AirliveConnection::run() {
             continue;
         }
 
-        blog(LOG_INFO, "[airlive] iPhone connected (%s)", peerKey.c_str());
+        const char *peerName = (identity_.role == "obs-bridge") ? "Airlive Bridge" : "iPhone";
+        blog(LOG_INFO, "[airlive] %s connected (%s)", peerName, peerKey.c_str());
 #ifdef SO_NOSIGPIPE
         // macOS/BSD: never raise SIGPIPE if the iPhone vanishes mid-send.
         int one = 1;
@@ -233,7 +276,7 @@ void AirliveConnection::run() {
         bonjour_.setBusy(false);
         parser_.reset();
         decoder_.reset();
-        blog(LOG_INFO, "[airlive] iPhone disconnected — listening for reconnect");
+        blog(LOG_INFO, "[airlive] %s disconnected — listening for reconnect", peerName);
     }
 
     bonjour_.stop();
@@ -264,7 +307,9 @@ void AirliveConnection::serveClient(socket_t client, const std::string &peerKey)
     // Mirror the Bridge: tell the phone to enable its encoder. Without this a phone left STICKY in
     // control-only mode (encoder off) is permanently video-dead in OBS. setEncoderEnabled is
     // idempotent, so a phone already in video+control just re-confirms. Enqueued — drained below.
-    sendControl("{\"type\":\"setDeliveryMode\",\"stringValue\":\"videoAndControl\"}");
+    // Not for the Bridge-program peer: it's the Bridge app relaying, not a camera to command.
+    if (identity_.role != "obs-bridge")
+        sendControl("{\"type\":\"setDeliveryMode\",\"stringValue\":\"videoAndControl\"}");
 
     std::vector<uint8_t> chunk(kRecvChunk);
     int idleMs = 0; // time since the last byte — resets on every recv
@@ -284,7 +329,10 @@ void AirliveConnection::serveClient(socket_t client, const std::string &peerKey)
             // Only reap on silence if the phone is actively sending VIDEO. A control-only camera
             // (videoActive=false) legitimately sends nothing for long stretches — reaping it here
             // caused a disconnect loop. TCP keepalive (set on accept) still catches a truly dead peer.
-            if (idleMs >= kStallTimeoutMs && peerVideoActive_.load()) {
+            // NEVER for the Bridge peer: it's loopback (a FIN/RST is reliable — no Wi-Fi half-open to
+            // guess about), and an idle-program Bridge legitimately sends nothing; the reaper here made
+            // the link flap every 8 s until something was cut to air.
+            if (idleMs >= kStallTimeoutMs && peerVideoActive_.load() && identity_.role != "obs-bridge") {
                 blog(LOG_INFO, "[airlive] no data for %d ms — assuming iPhone gone", idleMs);
                 return;
             }
