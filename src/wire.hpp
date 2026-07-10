@@ -46,6 +46,13 @@ enum class PacketType : uint8_t {
     AuthResult        = 5,
 };
 
+// Protocol GENERATION ladder (PROTOCOL-COMPAT-SPEC.md) — DISTINCT from kProtocolVersion (the
+// binary framing epoch, which never bumps). Counts additive protocol surface (verbs/fields/
+// types/TXT keys); used ONLY for the update-prompt UX (peer.proto < my.minProto → "update"),
+// NEVER for feature gating (that's the hello caps). Mirrors AirliveCore's AirliveProto.
+constexpr int kProtoGeneration = 2;    // this build: 1 = pre-hello, 2 = hello
+constexpr int kProtoMinGeneration = 1; // oldest peer generation we fully support (stays 1)
+
 // SHA-256 output size: a challenge nonce and a response tag are both 32 bytes.
 constexpr int kAuthTagLength = 32;
 

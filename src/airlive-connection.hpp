@@ -37,8 +37,13 @@ public:
     // Fired on every inbound type-2 (control) packet — a JSON ControlMessage,
     // e.g. the iPhone's full camera-state snapshot. Used for status display.
     using ControlSink = std::function<void(const char *json, size_t len)>;
+    // Fired once when the live client disconnects (peer FIN / dead-peer reap / stop) — lets the
+    // source reset per-connection peer state (the hello epoch) so a fresh/legacy reconnect isn't
+    // read against the previous camera's proto/caps. Runs on the WORKER thread.
+    using DisconnectSink = std::function<void()>;
 
-    AirliveConnection(ServiceIdentity identity, FrameSink sink, ControlSink control = nullptr);
+    AirliveConnection(ServiceIdentity identity, FrameSink sink, ControlSink control = nullptr,
+                      DisconnectSink disconnect = nullptr);
     ~AirliveConnection();
 
     AirliveConnection(const AirliveConnection &) = delete;
@@ -98,6 +103,7 @@ private:
     PacketParser parser_;
     H264Decoder decoder_;
     ControlSink controlSink_;
+    DisconnectSink disconnectSink_;
 
     std::thread thread_;
     std::atomic<bool> running_{false};

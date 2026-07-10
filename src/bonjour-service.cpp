@@ -1,9 +1,12 @@
 #include "bonjour-service.hpp"
 
 #include <cstring>
+#include <string>
 
 #include <obs-module.h>
 #include <dns_sd.h>
+
+#include "wire.hpp" // kProtoGeneration / kProtoMinGeneration for the pv/mpv TXT keys
 
 namespace airlive {
 
@@ -41,6 +44,9 @@ bool BonjourService::start(uint16_t port, const ServiceIdentity &id) {
     setTxt(txt, "sid", id_.sid);
     setTxt(txt, "src", id_.src);
     setTxt(txt, "busy", "0");
+    setTxt(txt, "ord", id_.ord);                              // channel order (asymmetry #6)
+    setTxt(txt, "pv", std::to_string(kProtoGeneration));     // protocol generation — the phone
+    setTxt(txt, "mpv", std::to_string(kProtoMinGeneration)); // can annotate/grey a row pre-connect
 
     // Port must be network byte order. name=NULL → use the host name; the phone
     // identifies us by the TXT record, not the service instance name.
@@ -79,6 +85,9 @@ bool BonjourService::publishTxt(bool busy) {
     setTxt(txt, "sid", id_.sid);
     setTxt(txt, "src", id_.src);
     setTxt(txt, "busy", busy ? "1" : "0");
+    setTxt(txt, "ord", id_.ord);                              // channel order (asymmetry #6)
+    setTxt(txt, "pv", std::to_string(kProtoGeneration));
+    setTxt(txt, "mpv", std::to_string(kProtoMinGeneration));
 
     // Passing NULL recordRef updates the service's primary TXT record in place —
     // no teardown, so the phone never sees the instance disappear/reappear.

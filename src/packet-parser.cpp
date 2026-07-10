@@ -35,15 +35,22 @@ void PacketParser::feed(const uint8_t *data, size_t len, const Emit &emit) {
         if (be32(h) != kMagic) { ++pos; continue; }
         if (h[4] != kProtocolVersion) { ++pos; continue; }
 
-        const uint8_t rawType = h[5];
-        // Accept every known type INCLUDING the auth packets (3/4/5); anything
-        // above AuthResult is an unknown/desynced byte → resync.
-        if (rawType > uint8_t(PacketType::AuthResult)) { ++pos; continue; }
-
         const uint32_t payloadLen = be32(h + 6);
         if (payloadLen > kMaxPayloadLength) { ++pos; continue; }
-
         const size_t total = size_t(kHeaderSize) + payloadLen;
+
+        const uint8_t rawType = h[5];
+        // FORWARD-COMPAT (PROTOCOL-COMPAT-SPEC §3): a type ABOVE AuthResult, on an otherwise
+        // valid header (good magic+version, sane length), is a packet from a NEWER peer — skip
+        // it WHOLE (header + payload), not one byte. Byte-resync used to walk THROUGH the unknown
+        // packet's payload, where embedded "ARLV" bytes mis-framed as packets. New types stay
+        // gated on the hello caps; this skip degrades a gating bug to "ignored", not "corrupted".
+        if (rawType > uint8_t(PacketType::AuthResult)) {
+            if (buffer_.size() - pos < total) break; // whole packet not here yet — wait
+            pos += total;
+            continue;
+        }
+
         if (buffer_.size() - pos < total) break; // wait for the rest of this packet
 
         Packet pkt;

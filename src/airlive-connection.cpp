@@ -74,10 +74,12 @@ std::string peerKeyFromSockaddr(const sockaddr_storage &ss) {
 }
 } // namespace
 
-AirliveConnection::AirliveConnection(ServiceIdentity identity, FrameSink sink, ControlSink control)
+AirliveConnection::AirliveConnection(ServiceIdentity identity, FrameSink sink, ControlSink control,
+                                     DisconnectSink disconnect)
     : identity_(std::move(identity)),
       decoder_(std::move(sink)),
-      controlSink_(std::move(control)) {}
+      controlSink_(std::move(control)),
+      disconnectSink_(std::move(disconnect)) {}
 
 AirliveConnection::~AirliveConnection() { stop(); }
 
@@ -276,6 +278,8 @@ void AirliveConnection::run() {
         bonjour_.setBusy(false);
         parser_.reset();
         decoder_.reset();
+        if (disconnectSink_)
+            disconnectSink_(); // reset the source's peer-hello epoch (PROTOCOL-COMPAT-SPEC invariant)
         blog(LOG_INFO, "[airlive] %s disconnected — listening for reconnect", peerName);
     }
 
@@ -303,6 +307,15 @@ void AirliveConnection::serveClient(socket_t client, const std::string &peerKey)
     connected_ = true;
     bonjour_.setBusy(true);
     peerVideoActive_.store(true); // assume video until a control-only snapshot says otherwise
+
+    // One-shot hello — FIRST control message after accept/auth (PROTOCOL-COMPAT-SPEC §2).
+    // Enqueued before setDeliveryMode so it goes out first (drainOutgoing preserves order).
+    // An old camera hits its verb switch `default:` and ignores it — harmless. caps = the
+    // protocol surface this plugin implements; new verbs/types stay gated on the PEER's caps.
+    // appVersion is display-only (tracks CMake project() 1.0.0); proto/minProto are ints.
+    sendControl(
+        "{\"type\":\"hello\",\"hello\":{\"app\":\"obs\",\"appVersion\":\"1.0.0\",\"proto\":2,\"minProto\":1,"
+        "\"caps\":[\"auth\",\"deliveryMode\",\"rotation\",\"capabilities\",\"tally\",\"updateRequired\"]}}");
 
     // Mirror the Bridge: tell the phone to enable its encoder. Without this a phone left STICKY in
     // control-only mode (encoder off) is permanently video-dead in OBS. setEncoderEnabled is

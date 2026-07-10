@@ -26,6 +26,8 @@ struct ServiceIdentity {
     std::string src; // source display name, default "OBS Source N"
     std::string role = "obs"; // Bonjour TXT role: "obs" (direct iPhone source) or
                               // "obs-bridge" (receives the Airlive Bridge program)
+    std::string ord = "0";    // operator's channel order (TXT "ord") so the phone can sort
+                              // multi-source by position, not just by name (asymmetry #6)
 };
 
 class BonjourService {
