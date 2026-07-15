@@ -1,5 +1,4 @@
 <div align="center">
-  <img src=".github/logo.png" width="130" alt="Airlive for OBS">
   <h1>Airlive for OBS</h1>
   <p><b>Bring an Airlive Camera (iPhone) feed straight into OBS Studio — no separate receiver app.</b></p>
 
