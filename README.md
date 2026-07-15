@@ -139,3 +139,18 @@ so it learns its current state immediately. This is the only thing the plugin
   control (ISO/shutter/WB/lens/zoom/focus/fps/LUT) is the remaining phase; wire
   priority is **tally ▸ video ▸ settings**, and tally is already on the
   latency-critical path.
+
+## Install (macOS)
+
+Grab the signed installer from
+[Releases](https://github.com/airlive-project/app-to-obs/releases/latest). It
+installs into your **user** OBS plugins folder (`~/Library/Application Support/
+obs-studio/plugins/`) — no admin — and ships an `uninstall.command` that removes
+it cleanly. Restart OBS, then add **+ → Airlive Camera** (direct iPhone) or
+**+ → Airlive Bridge** (relay from the Airlive Bridge app).
+
+## License
+
+**GPL-2.0** — see [`LICENSE`](LICENSE) and [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md),
+the standard license for an OBS plugin (it links GPL-2.0 libobs). The license
+covers the code; it doesn't grant use of the "Airlive" name or logo.
