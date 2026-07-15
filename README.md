@@ -3,7 +3,7 @@
   <p><b>Bring an Airlive Camera (iPhone) feed straight into OBS Studio — no separate receiver app.</b></p>
 
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPLv2-blue.svg" alt="License: GPL v2"></a>
-  <img src="https://img.shields.io/badge/macOS-%E2%80%A2%20Windows-lightgrey" alt="macOS / Windows">
+  <img src="https://img.shields.io/badge/macOS-14%2B-lightgrey" alt="macOS 14+">
   <img src="https://img.shields.io/badge/OBS-plugin-302E31" alt="OBS plugin">
   <a href="https://github.com/airlive-project/airlive-for-obs/releases/latest"><img src="https://img.shields.io/badge/Download-latest%20pkg-brightgreen" alt="Download latest pkg"></a>
 </div>
@@ -11,19 +11,21 @@
 ---
 
 An **OBS Studio source plugin** that brings a live video feed from the **Airlive
-Camera** iOS app directly into OBS as an async video source — no separate macOS
-"Airlive Studio" receiver needed. Use an iPhone as a clean, low-latency camera
-straight inside OBS.
+Camera** iOS app (App Store release coming soon) directly into OBS as an async
+video source — no separate receiver app needed. Use an iPhone as a clean,
+low-latency camera straight inside OBS.
 
-> Plugin binary: `airlive-obs`. OBS source / module name: **"Airlive OBS"**.
-> Source type id: `airlive_obs_source`. Named distinctly so it is never confused
-> with any older Airlive screen-mirroring plugin.
+> Plugin binary: `airlive-obs` · OBS module name: **"OBS Airlive"**. Two source
+> types: **Airlive Camera** (`airlive_obs_source`, direct iPhone) and
+> **Airlive Bridge** (`airlive_obs_bridge_source`, relay from the
+> [Airlive Bridge](https://github.com/airlive-project/airlive-bridge) app).
 
 The iPhone encodes a display-ready **H.264 1080p** proxy of its viewfinder and
 pushes it over plain **TCP**. This plugin is the **server/receiver**: it listens
 on an ephemeral port, advertises itself via Bonjour so the iPhone can discover
 it, accepts one iPhone per source, parses the framing, decodes H.264 with
-FFmpeg, and outputs frames to OBS.
+FFmpeg, and outputs frames to OBS. The wire format is the open
+[Airlive Protocol](https://github.com/airlive-project/airlive-protocol) (Apache-2.0).
 
 ## How it works
 
@@ -35,7 +37,7 @@ FFmpeg, and outputs frames to OBS.
  ARLV framed packets   ─────────────────►    PacketParser (stateful)
    type 0 SPS/PPS                              └► H264Decoder.setParameterSets
    type 1 AVCC sample                          └► H264Decoder.decodeSample
-   type 2 control (ignored in v1)                 └► AVFrame
+   type 2 control (status + tally)                └► AVFrame
                                                       └► obs_source_output_video
 ```
 
@@ -44,8 +46,9 @@ FFmpeg, and outputs frames to OBS.
   7777 — many receivers coexist on one LAN), then advertise **one
   `_airlive._tcp` instance per OBS source** with a TXT record:
   `v=1, role=obs, did=<per-install UUID>, dev=<group name>, sid=<source id>,
-  src=<source name>, busy=0|1`. The phone groups instances by `did` (header =
-  `dev`), lists each `src`, and flips the row to "In use" on `busy=1`.
+  src=<source name>, busy=0|1, ord=<sort index>, pv=<protocol generation>,
+  mpv=<min generation>`. The phone groups instances by `did` (header = `dev`),
+  lists each `src` ordered by `ord`, and flips a row to "In use" on `busy=1`.
 - **One connection per source.** `busy` flips on connect/disconnect; on
   disconnect we keep listening so the phone can reconnect.
 - **No cap** on the number of sources — add as many as you want.
@@ -83,7 +86,7 @@ and use its CMake. The bundled `CMakeLists.txt` here is a pragmatic standalone
 build for local iteration.
 
 Copy the built module and `data/` into your OBS `plugins` directory, then add an
-**"Airlive Camera (iPhone)"** source in OBS.
+**"Airlive Camera"** source in OBS.
 
 ## Verified against OBS source
 
@@ -117,15 +120,15 @@ it at the advertised source, and watch frames land in OBS.
 
 ## Source properties
 
-Each "Airlive OBS" source exposes:
+Each **Airlive Camera** source exposes:
 
 - **Status** — read-only: connected / waiting, live resolution+fps (from the
   decoded stream), and the iPhone's device / camera resolution / colour space /
   lens (from its control-state snapshot). A **Refresh status** button re-reads it.
 - **Fixed delay (ms)** — a deliberate presentation buffer (0–1000 ms, default
-  **120**), Studio-style. Decoded frames are held in an FFmpeg ref-counted queue
+  **120**). Decoded frames are held in an FFmpeg ref-counted queue
   and released by a presenter thread after the delay elapses; the pixel mapping
-  runs on that thread, so there's no contention with the socket/decoder. Set to
+  runs on that thread, so there is no contention with the socket/decoder. Set to
   0 for lowest latency.
 - **Device name / Source name** — the Bonjour `dev` (group header on the iPhone)
   and `src` (row label) labels.
