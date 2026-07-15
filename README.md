@@ -1,4 +1,15 @@
-# Airlive OBS
+<div align="center">
+  <img src=".github/logo.png" width="130" alt="Airlive for OBS">
+  <h1>Airlive for OBS</h1>
+  <p><b>Bring an Airlive Camera (iPhone) feed straight into OBS Studio — no separate receiver app.</b></p>
+
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPLv2-blue.svg" alt="License: GPL v2"></a>
+  <img src="https://img.shields.io/badge/macOS-%E2%80%A2%20Windows-lightgrey" alt="macOS / Windows">
+  <img src="https://img.shields.io/badge/OBS-plugin-302E31" alt="OBS plugin">
+  <a href="https://github.com/airlive-project/airlive-for-obs/releases/latest"><img src="https://img.shields.io/badge/Download-latest%20pkg-brightgreen" alt="Download latest pkg"></a>
+</div>
+
+---
 
 An **OBS Studio source plugin** that brings a live video feed from the **Airlive
 Camera** iOS app directly into OBS as an async video source — no separate macOS
@@ -143,7 +154,7 @@ so it learns its current state immediately. This is the only thing the plugin
 ## Install (macOS)
 
 Grab the signed installer from
-[Releases](https://github.com/airlive-project/app-to-obs/releases/latest). It
+[Releases](https://github.com/airlive-project/airlive-for-obs/releases/latest). It
 installs into your **user** OBS plugins folder (`~/Library/Application Support/
 obs-studio/plugins/`) — no admin — and ships an `uninstall.command` that removes
 it cleanly. Restart OBS, then add **+ → Airlive Camera** (direct iPhone) or
