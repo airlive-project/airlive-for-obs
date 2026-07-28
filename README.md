@@ -27,9 +27,17 @@ it, accepts one iPhone per source, parses the framing, decodes H.264 with
 FFmpeg, and outputs frames to OBS. The wire format is the open
 [Airlive Protocol](https://github.com/airlive-project/airlive-protocol) (Apache-2.0).
 
-**Airlive Camera (iPhone) → OBS:**
+This one plugin adds **two** source types in OBS — a direct iPhone feed and a
+relay from the [Airlive Bridge](https://github.com/airlive-project/airlive-bridge)
+multicam switcher:
+
+**Airlive Camera (iPhone) → OBS** — the **"Airlive Camera"** source:
 
 https://github.com/user-attachments/assets/1581b544-000e-473e-a2ba-f0543fcb5032
+
+**Airlive Bridge (program feed) → OBS** — the **"Airlive Bridge"** source:
+
+https://github.com/user-attachments/assets/e855d1e5-ffff-4490-a67b-6f993a7c8647
 
 ## How it works
 
