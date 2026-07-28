@@ -27,6 +27,10 @@ it, accepts one iPhone per source, parses the framing, decodes H.264 with
 FFmpeg, and outputs frames to OBS. The wire format is the open
 [Airlive Protocol](https://github.com/airlive-project/airlive-protocol) (Apache-2.0).
 
+**Airlive Camera (iPhone) → OBS:**
+
+https://github.com/user-attachments/assets/1581b544-000e-473e-a2ba-f0543fcb5032
+
 ## How it works
 
 ```
