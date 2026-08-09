@@ -111,10 +111,15 @@ echo "== sign (inside-out, hardened runtime) =="
 # runtime even for ad-hoc dev builds (matches obs-plugintemplate Release; a real
 # Developer ID identity would add --timestamp here).
 SIGN_ID="${SIGN_ID:--}"                          # ad-hoc by default; override with a Developer ID
+# A REAL identity must also carry a secure timestamp, or notarization rejects every
+# binary with "The signature does not include a secure timestamp" (and the bundled
+# FFmpeg dylibs fail the same way — they ship ad-hoc from obs-deps, so they MUST be
+# re-signed here too).  Ad-hoc ("-") can't be timestamped, hence the switch.
+TS=(); [ "$SIGN_ID" != "-" ] && TS=(--timestamp)
 for dylib in "$APP"/Contents/Frameworks/*.dylib; do
-  [ -e "$dylib" ] && codesign --force --options runtime --sign "$SIGN_ID" "$dylib"
+  [ -e "$dylib" ] && codesign --force --options runtime ${TS[@]+"${TS[@]}"} --sign "$SIGN_ID" "$dylib"
 done
-codesign --force --options runtime --sign "$SIGN_ID" "$APP"
+codesign --force --options runtime ${TS[@]+"${TS[@]}"} --sign "$SIGN_ID" "$APP"
 codesign --verify --verbose "$APP" && echo "  signed OK"
 
 if [ "${1:-}" = "install" ]; then

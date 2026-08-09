@@ -56,14 +56,22 @@ exit 0
 POST
 chmod +x "$SCRIPTS/postinstall"
 
+# Everything the installer SHOWS is English — this is shipped, user-facing product
+# text (only internal notes are ever in another language).
 printf '%s\n' \
   "Airlive for OBS — iPhone camera sources for OBS Studio" "" \
-  "После установки перезапусти OBS, затем Sources (+):" \
-  "  • Airlive Camera — телефон с приложением Airlive Camera напрямую" \
-  "  • Airlive Bridge — приём из приложения Airlive Bridge" "" \
-  "Требования: macOS $MIN_MACOS+, OBS Studio." > "$RESOURCES/welcome.txt"
-printf '%s\n' "Готово. Перезапусти OBS — источники Airlive Camera / Airlive Bridge появятся в меню +." \
-  "" "Удаление: запусти uninstall.command рядом с этим пакетом." > "$RESOURCES/conclusion.txt"
+  "This installs the Airlive plugin into your user OBS plugins folder." \
+  "No administrator password is required." "" \
+  "When it finishes, restart OBS and add a source with + :" \
+  "  • Airlive Camera — an iPhone running the Airlive Camera app, directly" \
+  "  • Airlive Bridge — the program feed from the Airlive Bridge app" "" \
+  "Requires macOS $MIN_MACOS or later and OBS Studio." > "$RESOURCES/welcome.txt"
+printf '%s\n' \
+  "Installation complete." "" \
+  "Restart OBS Studio — Airlive Camera and Airlive Bridge will then appear" \
+  "in the + (Add Source) menu." "" \
+  "To remove the plugin later, run uninstall.command, shipped next to this" \
+  "installer." > "$RESOURCES/conclusion.txt"
 
 echo "==> Building component .pkg"
 COMPONENT="$DIST/component.pkg"
