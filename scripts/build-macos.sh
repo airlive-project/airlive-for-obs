@@ -10,7 +10,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-OBS_INC="${OBS_INC:-/tmp/obs321/libobs}"        # obs-studio/libobs (obs-module.h …)
+# ⚠️ Build against the OLDEST OBS we support — NEVER the newest.  The headers bake
+# LIBOBS_API_VER into obs_module_ver(), and OBS REFUSES any module reporting a newer
+# libobs than its own: "Module … compiled with newer libobs 32.1", silently absent
+# from Loaded Modules.  Headers from 30.2.3 load on 30.2.3 → 31 → 32.x alike; headers
+# from 32.1 locked the plugin out of every OBS below 32.1 (hit in the field on OBS
+# 32.0.2, mid-broadcast).  Bump this only to raise the MINIMUM OBS we claim to support.
+OBS_INC="${OBS_INC:-/tmp/obs3023/libobs}"       # obs-studio/libobs (obs-module.h …) @ 30.2.3
 SIMDE_INC="${SIMDE_INC:-/tmp/simde}"            # obs-studio/deps/simde
 FFMPEG_INC="${FFMPEG_INC:-/opt/homebrew/include}"
 FFMPEG_LIB="${FFMPEG_LIB:-/opt/homebrew/opt/ffmpeg/lib}"
