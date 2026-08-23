@@ -1104,6 +1104,24 @@ void apply_settings(AirliveSourceCtx *ctx, obs_data_t *settings) {
     if (delay != ctx->delayMs.exchange(delay))
         ctx->delayReset.store(true); // re-converge the FIFO to the new target
 
+    // WHO PACES PLAYOUT. Two different things got conflated here before: the
+    // milliseconds of delay (ours) and the SMOOTHING of an uneven arrival rate
+    // (libobs's). We used to force unbuffered ALWAYS, which threw away the second
+    // one — and our delay FIFO does not replace it: in steady state it is strictly
+    // one-in / one-out, so it shifts frames later without evening out their rhythm.
+    // Unbuffered means libobs drains to the NEWEST frame every composite tick, so
+    // network jitter lands straight on air as judder that reads as a low frame rate
+    // even while a full 30 fps arrives. (Screen Mirroring never disabled it, which
+    // is why it looked smooth on the same machine where this stuttered.)
+    //
+    //   Unbuffered (+0 ms) -> unbuffered: no added latency, exactly as labelled.
+    //   any other preset   -> buffered:   libobs plays frames on their timestamps,
+    //                                     which IS the jitter buffer the operator asked for.
+    //   Bridge program     -> buffered:   its delay is applied upstream in the Bridge
+    //                                     app, but the frames still reached the Bridge
+    //                                     over Wi-Fi, so this last hop still needs pacing.
+    obs_source_set_async_unbuffered(ctx->source, ctx->role != "obs-bridge" && delay == 0);
+
     // The sid must survive restarts. Generate once and write it back into the
     // source's settings so it's saved with the scene collection.
     const char *sid = obs_data_get_string(settings, kSettingSid);
@@ -1119,11 +1137,8 @@ void *createWithRole(obs_data_t *settings, obs_source_t *source, const char *rol
     auto *ctx = new AirliveSourceCtx();
     ctx->source = source;
     ctx->role = role;
-    // Drop libobs's OWN async-frame FIFO (timestamp-paced playout) that otherwise stacks ~1 capture
-    // frame + up to ~1 compositor tick ON TOP of our delay FIFO. Unbuffered = libobs drains to the
-    // newest frame each composite tick, so our delay_ms FIFO is the SINGLE place latency is added and
-    // "Unbuffered (+0 ms)" finally means 0. Our presets remain the jitter buffer for bad networks.
-    obs_source_set_async_unbuffered(source, true);
+    // Playout pacing is decided per delay preset in apply_settings (called below), so it
+    // follows the operator changing the preset live — not just the initial create.
     ctx->did = loadOrCreateDid();
     apply_settings(ctx, settings);
     applyCameraControls(ctx, settings, /*sendDiffs=*/false); // seed cache, don't command
