@@ -25,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -51,6 +52,12 @@ namespace {
 constexpr const char *kSettingDeviceName = "device_name";
 constexpr const char *kSettingSourceName = "source_name";
 constexpr const char *kSettingOrder = "order"; // operator's channel order → Bonjour "ord" (#6)
+// Stamped into every source this build touches, so a ONE-TIME migration can tell settings
+// written by an older plugin from settings the operator actually chose.  It must default to
+// the OLD value: obs_data_get_int returns the DEFAULT for a key that was never stored, so a
+// default of "current" would make every legacy source look already-migrated.
+constexpr const char *kSettingsVersionKey = "settings_version";
+constexpr int kSettingsVersion = 2;   // 2 = unified delay ladder + numbered channel labels
 constexpr const char *kSettingDelayMs = "delay_ms";
 constexpr const char *kSettingSid = "sid"; // hidden — stable per-source id
 // Receiver-password auth (STREAM-AUTH-SPEC). Off by default.
@@ -83,10 +90,34 @@ constexpr const char *kCamColorSpace = "cam_colorspace"; // -> setColorSpace (st
 constexpr const char *kCamStab = "cam_stab";         // -> setStabilization (stringValue) — caps.stabilizations
 constexpr const char *kCamLutName = "cam_lut_name";  // -> setLUT (lutName; "" = clear) — caps.availableLuts
 
-constexpr int kDefaultDelayMs = 60; // LAN default (~2 frames @30fps). Our no-B-frame stream on a LAN
-                                    // has far less jitter than the 120ms SRT/WAN figure; presets
-                                    // 0/120/200/400 still let a bad-network operator dial back up.
+// ONE ladder across the whole product: 0 / 120 / 200 / 400 ms, defaulting to 120 — the same
+// values and the same default the Bridge offers per channel (LatencyPreset in the Bridge's
+// OutputSettings.swift).  This plugin used to add a 60 ms "LAN" rung and default to it, on the
+// reasoning that our no-B-frame stream jitters less on a LAN than the 120 ms SRT figure assumes.
+// True or not, it made the same product behave two different ways depending on which half of it
+// the operator was looking at, and left a value the Bridge could not express at all.  A rung
+// that only exists in one place is worse than a slightly conservative default.
+constexpr int kDefaultDelayMs = 120; // SRT's default jitter buffer — the Bridge's default too
 constexpr int kMaxDelayMs = 400;     // matches the highest preset (Safe)
+
+/// Snap a stored delay onto the shipping ladder.
+///
+/// A source saved before the ladder was unified can carry 60 ms, which no longer has an entry:
+/// OBS would show an empty picker and the operator could not tell what was in effect.  Ties go
+/// UP — a slightly larger buffer is the safe direction on a network we know nothing about.
+inline int snapDelayToPreset(int ms)
+{
+    static constexpr int kPresets[] = {0, 120, 200, 400};
+    int best = kDefaultDelayMs, bestDist = -1;
+    for (int p : kPresets) {
+        const int dist = ms > p ? ms - p : p - ms;
+        if (bestDist < 0 || dist < bestDist || (dist == bestDist && p > best)) {
+            best = p;
+            bestDist = dist;
+        }
+    }
+    return best;
+}
 constexpr size_t kSafetyCapFrames = 600; // anti-runaway if timestamps stop advancing
 
 // No decoded frame for this long ⇒ paint black. The on-air source lost signal, dropped, or the
@@ -1079,18 +1110,68 @@ const char *source_get_name_bridge(void *) {
     return obs_module_text("Airlive.SourceNameBridge");
 }
 
+/// Collects the labels already taken by the other Airlive camera sources.
+struct LabelScan {
+    obs_source_t *self;
+    std::set<std::string> used;
+};
+
+bool collectCameraLabel(void *data, obs_source_t *src) {
+    auto *scan = static_cast<LabelScan *>(data);
+    if (src == scan->self) return true;
+    const char *id = obs_source_get_id(src);
+    if (!id || strcmp(id, "airlive_obs_source") != 0) return true;
+    if (obs_data_t *s = obs_source_get_settings(src)) {
+        const char *name = obs_data_get_string(s, kSettingSourceName);
+        if (name && *name) scan->used.insert(name);
+        obs_data_release(s);
+    }
+    return true;
+}
+
+/// Lowest unused "Cam N" among the Airlive camera sources in this collection.
+///
+/// LOWEST FREE, not a running counter: delete Cam 2 of three and the next source added is
+/// Cam 2 again, not Cam 4 — the numbers stay tied to what actually exists. This is the same
+/// rule as the Bridge's defaultChannelName, deliberately, down to the "Cam " prefix.
+///
+/// Safe from the create callback: OBS adds a source to its list only AFTER create returns,
+/// so the enumeration cannot see (or deadlock on) the source being built.
+std::string nextCameraLabel(obs_source_t *self) {
+    LabelScan scan{self, {}};
+    obs_enum_sources(collectCameraLabel, &scan);
+    for (int n = 1; n < 1000; ++n) {
+        std::string candidate = "Cam " + std::to_string(n);
+        if (!scan.used.count(candidate)) return candidate;
+    }
+    return "Cam";
+}
+
 void apply_settings(AirliveSourceCtx *ctx, obs_data_t *settings) {
+    // ONE-TIME migration off the old defaults. Sources saved by earlier builds carry a delay
+    // from an era when this plugin forced unbuffered playout and offered a 60 ms rung the
+    // Bridge never had; those values are leftovers, not decisions. Stamping the version means
+    // a deliberate "Unbuffered" chosen from here on is never second-guessed again.
+    if (obs_data_get_int(settings, kSettingsVersionKey) < kSettingsVersion) {
+        obs_data_set_int(settings, kSettingDelayMs, kDefaultDelayMs);
+        obs_data_set_int(settings, kSettingsVersionKey, kSettingsVersion);
+    }
     ctx->dev = obs_data_get_string(settings, kSettingDeviceName);
 
-    // The iPhone-facing label defaults to the OBS source's OWN name — the unique
-    // name the operator typed when adding it (and can rename in the Sources
-    // list). Saved once so it persists; the operator can still override it in
-    // this source's properties. No counter (that produced ever-growing numbers
-    // unrelated to how many sources actually exist).
+    // The iPhone-facing label. A camera source is NUMBERED — "Cam 1", "Cam 2", … — by the
+    // same rule the Bridge names its channels, so an operator running both sees one scheme
+    // instead of two. It used to adopt the OBS source's own name, which meant every source
+    // announced whatever OBS had pre-filled and several could carry the same label.
+    // Saved once so it persists; the operator can still type anything here afterwards.
     ctx->src = obs_data_get_string(settings, kSettingSourceName);
     if (ctx->src.empty()) {
-        const char *sname = obs_source_get_name(ctx->source);
-        ctx->src = (sname && *sname) ? sname : "OBS Source";
+        if (ctx->role == "obs-bridge") {
+            // One Bridge-program source per OBS — nothing to number.
+            const char *sname = obs_source_get_name(ctx->source);
+            ctx->src = (sname && *sname) ? sname : "Program";
+        } else {
+            ctx->src = nextCameraLabel(ctx->source);
+        }
         obs_data_set_string(settings, kSettingSourceName, ctx->src.c_str());
     }
     // Operator's channel order → advertised as Bonjour TXT "ord" so the phone sorts multi-source
@@ -1100,7 +1181,7 @@ void apply_settings(AirliveSourceCtx *ctx, obs_data_t *settings) {
     // The Bridge-program source adds NO delay — the Bridge already switched and timed the program,
     // so it flies straight through (no operator delay control on that source, see get_properties).
     int delay = (ctx->role == "obs-bridge") ? 0 : int(obs_data_get_int(settings, kSettingDelayMs));
-    delay = delay < 0 ? 0 : (delay > kMaxDelayMs ? kMaxDelayMs : delay);
+    delay = delay < 0 ? 0 : (delay > kMaxDelayMs ? kMaxDelayMs : snapDelayToPreset(delay));
     if (delay != ctx->delayMs.exchange(delay))
         ctx->delayReset.store(true); // re-converge the FIFO to the new target
 
@@ -1188,6 +1269,7 @@ void source_get_defaults(obs_data_t *settings) {
     // No default for source_name — apply_settings adopts the OBS source name once.
     obs_data_set_default_int(settings, kSettingDelayMs, kDefaultDelayMs);
     obs_data_set_default_int(settings, kSettingOrder, 0); // default channel order = 0 (equal, name sort)
+    obs_data_set_default_int(settings, kSettingsVersionKey, 1); // 1 = "written before the stamp existed"
     obs_data_set_default_bool(settings, kSettingRequireAuth, false); // open by default
 
     obs_data_set_default_bool(settings, kCamAE, true);
@@ -1358,9 +1440,9 @@ obs_properties_t *source_get_properties(void *data) {
     obs_property_t *delay = obs_properties_add_list(props, kSettingDelayMs,
                                                     obs_module_text("Airlive.Delay"),
                                                     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    // Same four rungs, same wording, same default as the Bridge — see kDefaultDelayMs.
     obs_property_list_add_int(delay, "Unbuffered (+0 ms)", 0);  // libobs unbuffered / WebRTC min=0
-    obs_property_list_add_int(delay, "LAN (+60 ms)", 60);       // DEFAULT — kDefaultDelayMs (~2 frames)
-    obs_property_list_add_int(delay, "Normal (+120 ms)", 120);  // SRT default jitter buffer / WAN
+    obs_property_list_add_int(delay, "Normal (+120 ms)", 120);  // DEFAULT — SRT's jitter buffer
     obs_property_list_add_int(delay, "Smooth (+200 ms)", 200);  // WebRTC interactive upper bound
     obs_property_list_add_int(delay, "Safe (+400 ms)", 400);    // WebRTC buffer-against-glitches
     obs_property_set_long_description(

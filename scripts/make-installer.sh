@@ -45,6 +45,27 @@ for macho in "$FW"/*.dylib "$PAYLOAD/$INSTALL_DIR/$BUNDLE_NAME/Contents/MacOS/"*
 done
 shopt -u nullglob
 
+echo "==> Writing preinstall (clean replace — never install on top of the old bundle)"
+cat > "$SCRIPTS/preinstall" <<PRE
+#!/bin/bash
+# A pkg REPLACES files it ships and LEAVES everything else. Installed on top of an older
+# plugin, any file that version had and this one does not — a differently-versioned FFmpeg
+# dylib, say — survives inside the bundle forever: dead weight, and extra unsigned files in
+# a signed bundle. So the old bundle goes first and the install is always a clean one.
+#
+# Only ever OUR bundle, by exact name. Never a wildcard: this directory is shared with every
+# other OBS plugin the user has, Airlive Screen Mirroring included.
+rm -rf "\$HOME/$INSTALL_DIR/$BUNDLE_NAME"
+# A copy in the SYSTEM domain would load alongside ours and register the same sources twice.
+# This script runs as the user, so it cannot delete that one — it reports it instead, and the
+# uninstaller (run with the right privileges) clears it.
+if [ -d "/$INSTALL_DIR/$BUNDLE_NAME" ]; then
+  echo "WARNING: a system-wide copy exists at /$INSTALL_DIR/$BUNDLE_NAME — remove it or OBS will load two." >&2
+fi
+exit 0
+PRE
+chmod +x "$SCRIPTS/preinstall"
+
 echo "==> Writing postinstall (strip quarantine; NO force-quit of OBS)"
 cat > "$SCRIPTS/postinstall" <<POST
 #!/bin/bash

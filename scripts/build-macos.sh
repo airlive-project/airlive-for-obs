@@ -16,10 +16,18 @@ cd "$(dirname "$0")/.."
 # from Loaded Modules.  Headers from 30.2.3 load on 30.2.3 → 31 → 32.x alike; headers
 # from 32.1 locked the plugin out of every OBS below 32.1 (hit in the field on OBS
 # 32.0.2, mid-broadcast).  Bump this only to raise the MINIMUM OBS we claim to support.
-OBS_INC="${OBS_INC:-/tmp/obs3023/libobs}"       # obs-studio/libobs (obs-module.h …) @ 30.2.3
-SIMDE_INC="${SIMDE_INC:-/tmp/simde}"            # obs-studio/deps/simde
-FFMPEG_INC="${FFMPEG_INC:-/opt/homebrew/include}"
-FFMPEG_LIB="${FFMPEG_LIB:-/opt/homebrew/opt/ffmpeg/lib}"
+# Kept in ~/Documents, NOT /tmp: a checkout under /tmp is swept by the OS (a reboot was
+# enough), and the build then fails with "obs-module.h not found" as if the source tree
+# were broken.  Clone obs-studio 30.2.3 there once; see docs.
+OBS_INC="${OBS_INC:-$HOME/Documents/obs-studio-30.2.3/libobs}"   # obs-module.h … @ 30.2.3
+SIMDE_INC="${SIMDE_INC:-$HOME/Documents/obs-studio-30.2.3/libobs/util/simde}"
+# A FROZEN copy of the low-deployment-target FFmpeg this plugin ships (minos 11.0), kept
+# outside both /tmp and Homebrew.  Homebrew's own FFmpeg is built for the BUILD machine's
+# macOS (minos 26) and cannot load on users' Macs — the check further down fails the build
+# on exactly that.  Freezing the headers next to the libraries also means a Homebrew FFmpeg
+# upgrade can never silently change what this compiles against.
+FFMPEG_INC="${FFMPEG_INC:-$HOME/Documents/airlive-ffmpeg/include}"
+FFMPEG_LIB="${FFMPEG_LIB:-$HOME/Documents/airlive-ffmpeg/lib}"
 OBS_APP="${OBS_APP:-/Applications/OBS.app}"
 MIN_MACOS="${MIN_MACOS:-13.0}"                  # deployment target — ≤ OBS's own (12), matches Bridge (13)
 PLUGIN="airlive-obs"
