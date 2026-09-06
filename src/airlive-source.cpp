@@ -1313,6 +1313,21 @@ std::string buildStatusText(AirliveSourceCtx *ctx) {
     s += conn ? (bridge ? "● Receiving program from Airlive Bridge" : "● Connected")
               : (bridge ? "○ Waiting for Airlive Bridge…" : "○ Waiting for iPhone…");
 
+    // The Bridge-program source is on its way out, and it has to say so HERE too.
+    //
+    // The Bridge publishes the program as a system camera now: that path carries frames instead
+    // of a compressed stream, so cutting between cameras is instant rather than holding the last
+    // picture while the receiver resynchronises, and it needs no plugin at all. Updates arrive in
+    // whatever order they arrive, so someone will update the Bridge, switch it over, and be left
+    // looking at this source waiting for a connection that is never coming. This line is what
+    // tells them why, from inside OBS, without having to go and read release notes.
+    //
+    // The CAMERA source is not affected - a phone straight into OBS is still this plugin's job.
+    if (bridge) {
+        s += "\n\nThis source is being retired. Add a Video Capture Device source and pick "
+             "\"Airlive Bridge Virtual Camera\" instead.";
+    }
+
     if (conn) {
         const uint32_t w = ctx->statW.load(), h = ctx->statH.load();
         const int fps = int(ctx->statFps.load() + 0.5);
