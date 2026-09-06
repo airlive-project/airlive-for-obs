@@ -90,8 +90,19 @@ void AirliveConnection::start() {
 }
 
 void AirliveConnection::stop() {
-    if (!running_.exchange(false))
-        return;
+    // The FLAG IS NOT THE JOIN CONDITION, and treating it as one aborted OBS.
+    //
+    // A worker that returned on its own has already cleared `running_` - run() does exactly
+    // that when it cannot open its listen socket, which is the everyday case of a SECOND
+    // Bridge source losing the race for the fixed loopback port. A std::thread whose function
+    // has RETURNED is still joinable, so the early return skipped the join precisely when it
+    // was needed, and ~std::thread on a joinable thread calls std::terminate(). Removing that
+    // source took the whole of OBS down with it, from a stack with no hint of a socket in it.
+    //
+    // Joining unconditionally is also what makes stop() idempotent: after a join the thread is
+    // no longer joinable, so a second call does nothing. Only the destructor calls this, and
+    // never from the worker itself, so there is no self-join to fear.
+    running_.store(false);
     if (thread_.joinable())
         thread_.join();
 }
