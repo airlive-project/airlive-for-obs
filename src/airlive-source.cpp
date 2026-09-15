@@ -40,6 +40,7 @@ extern "C" {
 }
 
 #include "airlive-connection.hpp"
+#include "delay-ladder.hpp"
 #include "secret-store.hpp"
 
 OBS_DECLARE_MODULE()
@@ -90,34 +91,6 @@ constexpr const char *kCamColorSpace = "cam_colorspace"; // -> setColorSpace (st
 constexpr const char *kCamStab = "cam_stab";         // -> setStabilization (stringValue) — caps.stabilizations
 constexpr const char *kCamLutName = "cam_lut_name";  // -> setLUT (lutName; "" = clear) — caps.availableLuts
 
-// ONE ladder across the whole product: 0 / 120 / 200 / 400 ms, defaulting to 120 — the same
-// values and the same default the Bridge offers per channel (LatencyPreset in the Bridge's
-// OutputSettings.swift).  This plugin used to add a 60 ms "LAN" rung and default to it, on the
-// reasoning that our no-B-frame stream jitters less on a LAN than the 120 ms SRT figure assumes.
-// True or not, it made the same product behave two different ways depending on which half of it
-// the operator was looking at, and left a value the Bridge could not express at all.  A rung
-// that only exists in one place is worse than a slightly conservative default.
-constexpr int kDefaultDelayMs = 120; // SRT's default jitter buffer — the Bridge's default too
-constexpr int kMaxDelayMs = 400;     // matches the highest preset (Safe)
-
-/// Snap a stored delay onto the shipping ladder.
-///
-/// A source saved before the ladder was unified can carry 60 ms, which no longer has an entry:
-/// OBS would show an empty picker and the operator could not tell what was in effect.  Ties go
-/// UP — a slightly larger buffer is the safe direction on a network we know nothing about.
-inline int snapDelayToPreset(int ms)
-{
-    static constexpr int kPresets[] = {0, 120, 200, 400};
-    int best = kDefaultDelayMs, bestDist = -1;
-    for (int p : kPresets) {
-        const int dist = ms > p ? ms - p : p - ms;
-        if (bestDist < 0 || dist < bestDist || (dist == bestDist && p > best)) {
-            best = p;
-            bestDist = dist;
-        }
-    }
-    return best;
-}
 constexpr size_t kSafetyCapFrames = 600; // anti-runaway if timestamps stop advancing
 
 // No decoded frame for this long ⇒ paint black. The on-air source lost signal, dropped, or the
@@ -1148,10 +1121,11 @@ std::string nextCameraLabel(obs_source_t *self) {
 }
 
 void apply_settings(AirliveSourceCtx *ctx, obs_data_t *settings) {
-    // ONE-TIME migration off the old defaults. Sources saved by earlier builds carry a delay
-    // from an era when this plugin forced unbuffered playout and offered a 60 ms rung the
-    // Bridge never had; those values are leftovers, not decisions. Stamping the version means
-    // a deliberate "Unbuffered" chosen from here on is never second-guessed again.
+    // ONE-TIME migration off the old defaults. Sources saved by the earliest builds carry a delay
+    // from an era when this plugin forced unbuffered playout; those values are leftovers, not
+    // decisions. Stamping the version means a deliberate "Unbuffered" chosen from here on is never
+    // second-guessed again. The stamp does NOT move when the ladder gains a rung: 60 ms returning
+    // is not a reason to overwrite a choice somebody made.
     if (obs_data_get_int(settings, kSettingsVersionKey) < kSettingsVersion) {
         obs_data_set_int(settings, kSettingDelayMs, kDefaultDelayMs);
         obs_data_set_int(settings, kSettingsVersionKey, kSettingsVersion);
@@ -1455,14 +1429,13 @@ obs_properties_t *source_get_properties(void *data) {
     obs_property_t *delay = obs_properties_add_list(props, kSettingDelayMs,
                                                     obs_module_text("Airlive.Delay"),
                                                     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    // Same four rungs, same wording, same default as the Bridge — see kDefaultDelayMs.
-    obs_property_list_add_int(delay, "Unbuffered (+0 ms)", 0);  // libobs unbuffered / WebRTC min=0
-    obs_property_list_add_int(delay, "Normal (+120 ms)", 120);  // DEFAULT — SRT's jitter buffer
-    obs_property_list_add_int(delay, "Smooth (+200 ms)", 200);  // WebRTC interactive upper bound
-    obs_property_list_add_int(delay, "Safe (+400 ms)", 400);    // WebRTC buffer-against-glitches
+    // Straight from the shared ladder, so the picker and the snapper can never disagree.
+    for (const airlive::DelayRung &rung : airlive::kDelayLadder)
+        obs_property_list_add_int(delay, rung.label, rung.ms);
     obs_property_set_long_description(
-        delay, "Extra buffer on top of base latency. \"+0\" isn't true zero — it's \"show on "
-               "decode\". Higher = smoother on bad networks.");
+        delay, "Buffer added on top of the delay the pipeline already has. Unbuffered is not zero "
+               "delay, it is \"show on decode\" and adds nothing of its own. Each step up holds "
+               "frames a little longer, so a hiccup is absorbed instead of reaching air.");
     obs_properties_add_text(props, kSettingDeviceName, obs_module_text("Airlive.DeviceName"),
                             OBS_TEXT_DEFAULT);
     obs_properties_add_text(props, kSettingSourceName, obs_module_text("Airlive.SourceLabel"),

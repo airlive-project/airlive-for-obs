@@ -669,6 +669,14 @@ bool AirliveConnection::sendRaw(PacketType type, const uint8_t *payload, size_t 
 #endif
         if (!wouldBlock || spentMs >= kSendBudgetMs)
             return false; // real error, or budget spent — peer gone/wedged; read loop reaps it
+        // Teardown asked us to stop: abandon the packet NOW rather than spend the rest of the
+        // budget on a peer nobody is waiting for any more. stop() joins this thread, and the
+        // caller of stop() is OBS's graphics thread (a rename or a reorder rebuilds the
+        // connection; so does deleting the source) - that thread also drives video_tick for
+        // every other source, so half a second spent here is half a second of stutter on the
+        // whole output. A control packet dropped while shutting down costs nothing.
+        if (!running_.load())
+            return false;
         poll_fd_t pfd{};
         pfd.fd = clientFd_;
         pfd.events = POLLOUT;

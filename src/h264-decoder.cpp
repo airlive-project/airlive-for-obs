@@ -112,7 +112,11 @@ void H264Decoder::decodeSample(const uint8_t *payload, size_t len, int64_t pts_u
     while (pos + kAvccLengthBytes <= len) {
         const uint32_t nalLen = be32(payload + pos);
         pos += kAvccLengthBytes;
-        if (nalLen == 0 || pos + nalLen > len) {
+        // Widened deliberately: `nalLen` is a 32-bit field straight off the wire, and on a build
+        // where size_t is 32 bits `pos + nalLen` can wrap past the check and let a huge length
+        // through to a read far past the buffer. 64-bit arithmetic cannot wrap here, so the check
+        // holds on every target rather than only on the one we happen to ship today.
+        if (nalLen == 0 || uint64_t(pos) + uint64_t(nalLen) > uint64_t(len)) {
             blog(LOG_WARNING, "[airlive] malformed AVCC NAL — dropping access unit");
             return;
         }

@@ -137,11 +137,14 @@ Each **Airlive Camera** source exposes:
 - **Status** — read-only: connected / waiting, live resolution+fps (from the
   decoded stream), and the iPhone's device / camera resolution / colour space /
   lens (from its control-state snapshot). A **Refresh status** button re-reads it.
-- **Fixed delay (ms)** — a deliberate presentation buffer (0–1000 ms, default
-  **120**). Decoded frames are held in an FFmpeg ref-counted queue
-  and released by a presenter thread after the delay elapses; the pixel mapping
-  runs on that thread, so there is no contention with the socket/decoder. Set to
-  0 for lowest latency.
+- **Fixed delay (ms)** - a deliberate presentation buffer, chosen from the same ladder the
+  Airlive Bridge offers: **Unbuffered (0)**, **Low (60)**, **Normal (120, default)**,
+  **High (200)**, **Safe (400)**. Every value is a real shipping standard rather than a round
+  number: 0 is libobs unbuffered, 60 is under two frames at 30 fps, 120 is SRT's own default
+  jitter buffer, 200 is the top of WebRTC's interactive band, 400 is its buffer-against-glitches
+  figure. Decoded frames wait in a queue and are released when the delay has elapsed; decode,
+  delay and output all run on the one connection worker thread, so there is nothing to lock and
+  nothing to contend with. Unbuffered is not zero delay, it is "show on decode".
 - **Device name / Source name** — the Bonjour `dev` (group header on the iPhone)
   and `src` (row label) labels.
 
@@ -159,11 +162,16 @@ so it learns its current state immediately. This is the only thing the plugin
 - **v1 is video-only.** The protocol defines no audio packet type.
 - **H.264 only** by design — the wire is a fixed display-ready proxy. The camera
   can *record* HEVC/ProRes locally, but never sends them over the wire.
-- **Control channel (type 2)** — partially used: inbound state snapshots feed
-  the status display, and tally (`setCue`) is sent outbound. Full remote camera
-  control (ISO/shutter/WB/lens/zoom/focus/fps/LUT) is the remaining phase; wire
-  priority is **tally ▸ video ▸ settings**, and tally is already on the
-  latency-critical path.
+- **Control channel (type 2)** - fully used. Inbound state snapshots feed the status display
+  and the control widgets; outbound go tally (`setCue`) and the camera controls themselves:
+  exposure and white-balance auto, ISO, shutter, temperature, tint, EV, focus and its auto,
+  lens, zoom, fps, resolution, colour space, stabilization, LUT by name, ISO compensation.
+  Ranges come from the phone's own `capabilities`, so a control never offers a value the
+  hardware cannot reach. Wire priority is **tally, then video, then settings**.
+- **Receiver password** - optional HMAC challenge-response on connect (see
+  `STREAM-AUTH-SPEC.md`), off by default. It is access control on the LAN, not encryption: the
+  video is not a secret, the point is that a stranger on the same Wi-Fi cannot take the slot or
+  push a fake feed.
 
 ## Install (macOS)
 
