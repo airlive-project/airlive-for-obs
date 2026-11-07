@@ -41,9 +41,21 @@ public:
     // source reset per-connection peer state (the hello epoch) so a fresh/legacy reconnect isn't
     // read against the previous camera's proto/caps. Runs on the WORKER thread.
     using DisconnectSink = std::function<void()>;
+    // Fired once when a camera that went silent (no bytes for kSilenceMs) speaks again on the SAME
+    // connection - its route came back. The source answers with the current tally cue. Worker thread.
+    using LinkResumedSink = std::function<void()>;
+
+    // Fired when the picture starts waiting after a silence, and for each sample while it waits.
+    // The owner of the delay decides whether a sample may bring the picture back (`check`, true =
+    // show it): only it knows whether the sample can still play in its slot. Worker thread.
+    struct ResumeGate {
+        std::function<void()> begin;
+        std::function<bool(int64_t pts_us, bool isKeyframe)> check;
+    };
 
     AirliveConnection(ServiceIdentity identity, FrameSink sink, ControlSink control = nullptr,
-                      DisconnectSink disconnect = nullptr);
+                      DisconnectSink disconnect = nullptr, LinkResumedSink resumed = nullptr,
+                      ResumeGate resumeGate = {});
     ~AirliveConnection();
 
     AirliveConnection(const AirliveConnection &) = delete;
@@ -54,9 +66,9 @@ public:
 
     bool connected() const { return connected_.load(); }
 
-    // Send a control message (type-2) back to the iPhone over the same socket.
-    // Thread-safe. Returns true only if the whole packet was written; false if
-    // no iPhone is connected or the send was dropped (so the caller can retry).
+    // Queue a control message (type-2) for the iPhone; the worker thread sends it. Thread-safe.
+    // Returns false, and queues nothing, when no iPhone is connected: a command is never kept for
+    // later, so a returning phone is never flooded with stale cues or settings.
     bool sendControl(const std::string &json);
 
     // Apply the receiver-password auth config (called from the OBS UI thread when
@@ -69,8 +81,9 @@ private:
     void run();                        // thread body
     socket_t openListenSocket(uint16_t &outPort);
     // Blocking read loop for one iPhone.  `peerKey` (remote IP) keys the
-    // anti-bruteforce ledger.  Runs the auth handshake first when required.
-    void serveClient(socket_t client, const std::string &peerKey);
+    // anti-bruteforce ledger.  Runs the auth handshake first when required.  Also watches
+    // `listenFd` for a returning phone (takeover).  Returns why the connection ended, for the log.
+    const char *serveClient(socket_t client, const std::string &peerKey, socket_t listenFd);
 
     // Auth handshake (worker thread).  Sends one challenge, processes ONLY the
     // response (buffering the latest format, dropping samples) until it verifies
@@ -104,6 +117,14 @@ private:
     H264Decoder decoder_;
     ControlSink controlSink_;
     DisconnectSink disconnectSink_;
+    LinkResumedSink linkResumedSink_;
+    ResumeGate resumeGate_;
+
+    // Just back from silence: the phone first delivers what its socket held when the route went
+    // (old frames), then a keyframe. Samples are dropped until `resumeGate_` accepts one, so OBS
+    // never replays a moment that already passed. Worker thread only.
+    bool awaitingResumeKeyframe_{false};
+    int64_t lastResumeKeyframeAskMs_{0}; // when that keyframe was last asked for. Worker thread only.
 
     std::thread thread_;
     std::atomic<bool> running_{false};

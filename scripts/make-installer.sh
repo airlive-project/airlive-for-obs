@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# make-installer.sh — package the already-built "Airlive for OBS" plugin (Airlive Camera +
-# Airlive Bridge sources) into a double-click .pkg for OBS Studio.
+# make-installer.sh — package the already-built "Airlive for OBS" plugin (the Airlive Camera
+# source) into a double-click .pkg for OBS Studio.
 #
 # Run AFTER scripts/build-macos.sh (which produces a self-contained, minos-restamped, signed
 # build/airlive-obs.plugin). This step only wraps that bundle in a pkg — no re-bundling.
@@ -80,16 +80,15 @@ chmod +x "$SCRIPTS/postinstall"
 # Everything the installer SHOWS is English — this is shipped, user-facing product
 # text (only internal notes are ever in another language).
 printf '%s\n' \
-  "Airlive for OBS — iPhone camera sources for OBS Studio" "" \
+  "Airlive for OBS - iPhone camera source for OBS Studio" "" \
   "This installs the Airlive plugin into your user OBS plugins folder." \
   "No administrator password is required." "" \
   "When it finishes, restart OBS and add a source with + :" \
-  "  • Airlive Camera — an iPhone running the Airlive Camera app, directly" \
-  "  • Airlive Bridge — the program feed from the Airlive Bridge app" "" \
+  "  • Airlive Camera - an iPhone running the Airlive Camera app, directly" "" \
   "Requires macOS $MIN_MACOS or later and OBS Studio." > "$RESOURCES/welcome.txt"
 printf '%s\n' \
   "Installation complete." "" \
-  "Restart OBS Studio — Airlive Camera and Airlive Bridge will then appear" \
+  "Restart OBS Studio - Airlive Camera will then appear" \
   "in the + (Add Source) menu." "" \
   "To remove the plugin later, run uninstall.command, shipped next to this" \
   "installer." > "$RESOURCES/conclusion.txt"

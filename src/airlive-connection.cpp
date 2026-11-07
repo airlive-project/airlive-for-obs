@@ -25,12 +25,28 @@ constexpr size_t kRecvChunk = 64 * 1024;
 // Must match kBridgeLocalPort in airlive-bridge/Sources/Output/AirliveRelayOutput.swift.
 constexpr uint16_t kBridgeLocalPort = 47788;
 
-// A live feed delivers frames continuously. If no bytes arrive for this long,
-// the peer is gone — even if it never sent a TCP FIN (app backgrounded, Wi-Fi
-// dropped, walked out of range). Reaping the dead socket frees the single slot
-// so the iPhone can reconnect. Without this the worker would loop forever on a
-// half-open connection and block every reconnect.
-constexpr int kStallTimeoutMs = 8000;
+// No bytes for this long = the camera's link is silent. The camera goes completely quiet when its
+// route is lost and RESUMES ON THE SAME CONNECTION when it returns, so silence is not a reason to
+// close: OBS paints black (source_video_tick) and the socket is kept. The first bytes after the
+// silence mark the return (tally re-sent, the stale tail dropped). Same threshold as the Bridge:
+// a 5x lens switch keeps the camera quiet for up to ~1.2 s and must not count as a lost link.
+constexpr int64_t kSilenceMs = 1500;
+
+// While the picture waits for its keyframe after a silence, ask again at most this often. The
+// camera makes keyframes only on request (natural ones are 15-30 s apart) and ignores a request
+// that lands inside its own spacing window, so one lost request must not mean a long black; a
+// keyframe is also the heaviest frame, so never more than one a second on a weak link.
+constexpr int64_t kResumeKeyframeIntervalMs = 1000;
+
+// A new connection while the slot is held usually means the phone came back on a NEW socket (app
+// relaunched, phone rebooted) and the held one is a dead corpse keepalive has not reaped yet: the
+// newcomer takes over at once. Not within this age, though: one phone opens an IPv6 and an IPv4
+// socket together, and the second must not evict the first (the Bridge's rule, same numbers).
+constexpr int64_t kTakeoverMinAgeMs = 3000;
+
+// A peer that stops acknowledging what WE send is dead as surely as one that stops answering
+// keepalive probes; keepalive does not cover it. Same bound as the Bridge.
+constexpr int kConnectionDropSeconds = 30;
 
 // Auth handshake budget: how long we wait for a valid response before FINning a
 // connection that never authenticates. Pinned to 15 s across ALL receivers
@@ -72,14 +88,36 @@ std::string peerKeyFromSockaddr(const sockaddr_storage &ss) {
     }
     return buf[0] ? std::string(buf) : std::string("?");
 }
+
+// Whether an AVCC access unit (4-byte big-endian NAL lengths) holds an IDR slice (NAL type 5).
+// The camera's keyframe is the first live picture after it comes back: it does NOT re-send its
+// format then (only once per connection, or when a receiver asks for a keyframe), so the keyframe
+// itself has to be recognised. Malformed lengths end the walk - "no IDR" is the safe answer.
+bool containsIdr(const uint8_t *p, size_t len) {
+    size_t pos = 0;
+    while (pos + 4 < len) {
+        const uint32_t n = (uint32_t(p[pos]) << 24) | (uint32_t(p[pos + 1]) << 16) |
+                           (uint32_t(p[pos + 2]) << 8) | uint32_t(p[pos + 3]);
+        pos += 4;
+        if (n == 0 || uint64_t(pos) + n > uint64_t(len))
+            return false;
+        if ((p[pos] & 0x1F) == 5)
+            return true;
+        pos += n;
+    }
+    return false;
+}
 } // namespace
 
 AirliveConnection::AirliveConnection(ServiceIdentity identity, FrameSink sink, ControlSink control,
-                                     DisconnectSink disconnect)
+                                     DisconnectSink disconnect, LinkResumedSink resumed,
+                                     ResumeGate resumeGate)
     : identity_(std::move(identity)),
       decoder_(std::move(sink)),
       controlSink_(std::move(control)),
-      disconnectSink_(std::move(disconnect)) {}
+      disconnectSink_(std::move(disconnect)),
+      linkResumedSink_(std::move(resumed)),
+      resumeGate_(std::move(resumeGate)) {}
 
 AirliveConnection::~AirliveConnection() { stop(); }
 
@@ -244,8 +282,8 @@ void AirliveConnection::run() {
         int one = 1;
         setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
-        // Keepalive as a backstop for a peer that dies without a FIN; the
-        // stall timeout in serveClient is the primary, faster detector.
+        // Keepalive is what frees the slot from a peer that died without a FIN (silence alone no
+        // longer closes: a camera with no route is silent and comes back on this same socket).
         int ka = 1;
         setsockopt(client, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char *>(&ka), sizeof(ka));
         int idle = 10; // seconds idle before the first keepalive probe
@@ -254,10 +292,10 @@ void AirliveConnection::run() {
 #elif defined(TCP_KEEPIDLE)
         setsockopt(client, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));  // Linux
 #endif
-        // Probe interval + count so a dead peer is detected in ~15-25s, not the ~10 min OS default.
-        // This matters MORE now that a control-only camera (videoActive=false) is exempt from the 8s
-        // app-layer stall reaper — keepalive is then the ONLY thing that frees the slot if it dies.
-        int kaIntvl = 5, kaCnt = 3;
+        // 10 s idle + 3 probes 10 s apart ≈ 40 s, the Bridge's numbers: well inside a service, and
+        // gentle on the phone's radio (probing every few seconds wakes it for nothing). A phone that
+        // returns on a new socket never waits for this - it takes over (see serveClient).
+        int kaIntvl = 10, kaCnt = 3;
 #if defined(TCP_KEEPINTVL)
         setsockopt(client, IPPROTO_TCP, TCP_KEEPINTVL, &kaIntvl, sizeof(kaIntvl));
 #endif
@@ -270,6 +308,10 @@ void AirliveConnection::run() {
         // and Bridge (tcp.noDelay=true) already disable it; make all three ends consistent.
         int nodelay = 1;
         setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+#if defined(TCP_RXT_CONNDROPTIME)
+        int dropTime = kConnectionDropSeconds; // macOS: give up on data the peer never acknowledges
+        setsockopt(client, IPPROTO_TCP, TCP_RXT_CONNDROPTIME, &dropTime, sizeof(dropTime));
+#endif
         {
             std::lock_guard<std::mutex> lk(sendMutex_);
             clientFd_ = client;
@@ -278,7 +320,8 @@ void AirliveConnection::run() {
         // AFTER auth passes (or immediately when auth is off), so an
         // unauthenticated peer never reserves the slot (STREAM-AUTH-SPEC §4).
 
-        serveClient(client, peerKey);
+        const int64_t startedMs = nowMs();
+        const char *reason = serveClient(client, peerKey, listenFd);
 
         {
             std::lock_guard<std::mutex> lk(sendMutex_);
@@ -286,19 +329,27 @@ void AirliveConnection::run() {
         }
         close_socket(client);
         connected_ = false;
+        {
+            // Nothing queued for this phone outlives it (see sendControl).
+            std::lock_guard<std::mutex> lk(outMutex_);
+            outControl_.clear();
+        }
+        awaitingResumeKeyframe_ = false;
         bonjour_.setBusy(false);
         parser_.reset();
         decoder_.reset();
         if (disconnectSink_)
             disconnectSink_(); // reset the source's peer-hello epoch (PROTOCOL-COMPAT-SPEC invariant)
-        blog(LOG_INFO, "[airlive] %s disconnected — listening for reconnect", peerName);
+        blog(LOG_INFO, "[airlive] %s %s disconnected (%s) after %lld s - listening for reconnect",
+             peerName, peerKey.c_str(), reason, (long long)((nowMs() - startedMs) / 1000));
     }
 
     bonjour_.stop();
     close_socket(listenFd);
 }
 
-void AirliveConnection::serveClient(socket_t client, const std::string &peerKey) {
+const char *AirliveConnection::serveClient(socket_t client, const std::string &peerKey,
+                                          socket_t listenFd) {
     setNonBlocking(client);
 
     // Snapshot the auth config once for this whole connection so a settings
@@ -311,13 +362,20 @@ void AirliveConnection::serveClient(socket_t client, const std::string &peerKey)
         password = authPassword_;
     }
     if (requireAuth && !runAuthHandshake(client, peerKey, password))
-        return; // rejected / timed out — run() closes the socket
+        return "not authorised"; // rejected / timed out — run() closes the socket
 
     // Authorized (or auth off): NOW reserve the slot + advertise busy. An
     // unauthenticated peer never got this far, so it never held the channel.
+    {
+        // A clean slate: nothing queued before this phone was here is sent to it.
+        std::lock_guard<std::mutex> lk(outMutex_);
+        outControl_.clear();
+    }
     connected_ = true;
     bonjour_.setBusy(true);
     peerVideoActive_.store(true); // assume video until a control-only snapshot says otherwise
+    awaitingResumeKeyframe_ = false;
+    const int64_t committedMs = nowMs();
 
     // One-shot hello — FIRST control message after accept/auth (PROTOCOL-COMPAT-SPEC §2).
     // Enqueued before setDeliveryMode so it goes out first (drainOutgoing preserves order).
@@ -335,35 +393,72 @@ void AirliveConnection::serveClient(socket_t client, const std::string &peerKey)
     if (identity_.role != "obs-bridge")
         sendControl("{\"type\":\"setDeliveryMode\",\"stringValue\":\"videoAndControl\"}");
 
+    // A returning phone is watched for only on the camera source: the Bridge-program peer is a
+    // loopback link from one app, with a reliable FIN.
+    bool watchListen = identity_.role != "obs-bridge" && listenFd != kInvalidSocket;
+
     std::vector<uint8_t> chunk(kRecvChunk);
-    int idleMs = 0; // time since the last byte — resets on every recv
+    int64_t lastRxMs = nowMs(); // when the last byte arrived
+    bool silent = false;        // past kSilenceMs with nothing - logged once per silence
 
     while (running_.load()) {
         drainOutgoing(); // flush queued tally / delivery-mode on the worker thread (never inline)
-        poll_fd_t pfd{};
-        pfd.fd = client;
-        pfd.events = POLLIN;
-        const int pr = poll_sockets(&pfd, 1, kPollTimeoutMs);
+        poll_fd_t pfds[2]{};
+        pfds[0].fd = client;
+        pfds[0].events = POLLIN;
+        unsigned long nfds = 1;
+        if (watchListen) {
+            pfds[1].fd = listenFd;
+            pfds[1].events = POLLIN;
+            nfds = 2;
+        }
+        const int pr = poll_sockets(pfds, nfds, kPollTimeoutMs);
         if (pr < 0)
-            return;
+            return "poll error";
         if (pr == 0) {
-            // No data this interval. A live feed never goes quiet for long, so a
-            // sustained silence means the peer vanished without a FIN.
-            idleMs += kPollTimeoutMs;
-            // Only reap on silence if the phone is actively sending VIDEO. A control-only camera
-            // (videoActive=false) legitimately sends nothing for long stretches — reaping it here
-            // caused a disconnect loop. TCP keepalive (set on accept) still catches a truly dead peer.
-            // NEVER for the Bridge peer: it's loopback (a FIN/RST is reliable — no Wi-Fi half-open to
-            // guess about), and an idle-program Bridge legitimately sends nothing; the reaper here made
-            // the link flap every 8 s until something was cut to air.
-            if (idleMs >= kStallTimeoutMs && peerVideoActive_.load() && identity_.role != "obs-bridge") {
-                blog(LOG_INFO, "[airlive] no data for %d ms — assuming iPhone gone", idleMs);
-                return;
+            // Silence is NOT a reason to close: a camera that lost its route is quiet and comes back
+            // on this socket (OBS shows black meanwhile). Keepalive and the drop time free the slot
+            // from a peer that is really gone.
+            if (!silent && nowMs() - lastRxMs >= kSilenceMs) {
+                silent = true;
+                if (peerVideoActive_.load())
+                    blog(LOG_INFO, "[airlive] nothing from the iPhone for %lld ms - keeping the connection",
+                         (long long)kSilenceMs);
             }
             continue;
         }
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
-            return;
+
+        if (nfds == 2 && (pfds[1].revents & POLLIN)) {
+            // Another phone (or this one, back on a new socket) is connecting while the slot is held.
+            if (nowMs() - committedMs >= kTakeoverMinAgeMs && !requireAuth) {
+                // The held socket is a corpse keepalive has not reaped yet: let the newcomer in now.
+                // run() closes this one and accepts the waiting connection on its next turn.
+                blog(LOG_INFO, "[airlive] new connect while the slot is held - taking over");
+                return "superseded by a new connection";
+            }
+            // A sibling of the connection just made (IPv6 + IPv4 from one phone), or a stranger
+            // while a password is set (it must not kick a live camera): refuse it.
+            sockaddr_storage peer{};
+            socklen_t peerLen = sizeof(peer);
+            socket_t other = ::accept(listenFd, reinterpret_cast<sockaddr *>(&peer), &peerLen);
+            if (other != kInvalidSocket) {
+                blog(LOG_INFO, "[airlive] refused %s: slot held%s", peerKeyFromSockaddr(peer).c_str(),
+                     requireAuth ? ", password on (no takeover)" : " (sibling of the connection just made)");
+                close_socket(other);
+            } else {
+                // accept() itself failing (out of descriptors) would leave the listen socket
+                // readable and spin this loop: stop watching it for the rest of this connection.
+                watchListen = false;
+                blog(LOG_WARNING, "[airlive] could not refuse a waiting connection - not watching for one any more");
+            }
+        }
+
+        if (!(pfds[0].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)))
+            continue;
+        // A peer that closed reports POLLHUP together with POLLIN: read on, recv() says FIN and
+        // delivers whatever came before it.
+        if (!(pfds[0].revents & POLLIN))
+            return "socket error";
 
 #ifdef _WIN32
         const int n = ::recv(client, reinterpret_cast<char *>(chunk.data()), int(chunk.size()), 0);
@@ -371,7 +466,7 @@ void AirliveConnection::serveClient(socket_t client, const std::string &peerKey)
         const ssize_t n = ::recv(client, chunk.data(), chunk.size(), 0);
 #endif
         if (n == 0)
-            return; // peer closed
+            return "peer closed (FIN)";
         if (n < 0) {
 #ifdef _WIN32
             if (WSAGetLastError() == WSAEWOULDBLOCK)
@@ -379,27 +474,67 @@ void AirliveConnection::serveClient(socket_t client, const std::string &peerKey)
 #else
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                 continue;
+            if (errno == ETIMEDOUT)
+                return "timed out (no answer from the iPhone)";
 #endif
-            return; // real error
+            return "receive error";
         }
 
-        idleMs = 0; // got bytes — peer is alive
+        const int64_t now = nowMs();
+        if (now - lastRxMs >= kSilenceMs) {
+            // Back on the same connection after a silence: its route returned. What its socket held
+            // arrives first (old frames), then a keyframe; drop the old ones until then.
+            // Not the retired Bridge link: an idle program is quiet by nature and may resume on any
+            // frame, and nothing times it here.
+            if (peerVideoActive_.load() && identity_.role != "obs-bridge") {
+                awaitingResumeKeyframe_ = true;
+                if (resumeGate_.begin)
+                    resumeGate_.begin();
+                // ASK for it: the camera makes a keyframe by itself only when iOS reported its route
+                // gone and back; a Wi-Fi stall that kept the route leaves it sending P-frames, and
+                // its next natural keyframe is up to 15 s away. The same request the Bridge makes.
+                sendControl("{\"type\":\"forceKeyframe\"}");
+                lastResumeKeyframeAskMs_ = now;
+                blog(LOG_INFO, "[airlive] iPhone back after %lld ms - asked for a keyframe",
+                     (long long)(now - lastRxMs));
+            }
+            // Its lamp went dark meanwhile: one current cue. A Control-only camera is quiet by
+            // nature, so for it any message after a quiet second counts - one tiny, idempotent cue,
+            // and the only way to catch its real return (the camera sends one snapshot then).
+            if (linkResumedSink_)
+                linkResumedSink_();
+        }
+        silent = false;
         parser_.feed(chunk.data(), size_t(n), [this](const Packet &pkt) {
             switch (pkt.type) {
             case PacketType::FormatDescription:
                 decoder_.setParameterSets(pkt.payload, pkt.payload_len);
                 break;
             case PacketType::Sample:
-                peerVideoActive_.store(true); // a sample IS video — re-arm the stall reaper
+                if (awaitingResumeKeyframe_) {
+                    const bool idr = containsIdr(pkt.payload, pkt.payload_len);
+                    const bool show = resumeGate_.check ? resumeGate_.check(pkt.timestamp_us, idr) : idr;
+                    if (!show) {
+                        // The tail, or a keyframe too late for its slot - see awaitingResumeKeyframe_.
+                        const int64_t sampleMs = nowMs();
+                        if (sampleMs - lastResumeKeyframeAskMs_ >= kResumeKeyframeIntervalMs) {
+                            lastResumeKeyframeAskMs_ = sampleMs;
+                            sendControl("{\"type\":\"forceKeyframe\"}");
+                        }
+                        break;
+                    }
+                    awaitingResumeKeyframe_ = false; // its keyframe: live video again
+                    blog(LOG_INFO, "[airlive] picture back");
+                }
+                peerVideoActive_.store(true);
                 decoder_.decodeSample(pkt.payload, pkt.payload_len, pkt.timestamp_us);
                 break;
             case PacketType::Control:
-                // The iPhone sends a JSON state snapshot here on connect and
-                // after camera-side changes. We surface it for status display;
-                // sending set-commands back (tally) is the only write we do.
-                // Track videoActive so the stall reaper exempts a control-only camera. Lightweight
-                // substring scan of the JSON (Swift JSONEncoder emits no spaces around ':'); absent
-                // key (older camera) leaves the prior value, defaulting to true = reaper armed.
+                // The iPhone sends a JSON state snapshot here on connect and after camera-side
+                // changes. Track videoActive (a Control-only camera is quiet by nature, so its
+                // silence is neither logged nor treated as a lost picture). Lightweight substring
+                // scan of the JSON (Swift JSONEncoder emits no spaces around ':'); absent key (older
+                // camera) leaves the prior value.
                 if (pkt.payload_len) {
                     const std::string s(reinterpret_cast<const char *>(pkt.payload), pkt.payload_len);
                     if (s.find("\"videoActive\":false") != std::string::npos)
@@ -419,7 +554,10 @@ void AirliveConnection::serveClient(socket_t client, const std::string &peerKey)
                 break;
             }
         });
+        // Taken AFTER decoding, so the time spent decoding is never mistaken for silence.
+        lastRxMs = nowMs();
     }
+    return "stopped";
 }
 
 // ---- auth handshake (worker thread) ---------------------------------------
@@ -584,8 +722,13 @@ bool AirliveConnection::sendControl(const std::string &json) {
     // ENQUEUE only — never send inline. sendControl is reachable from the OBS render/video thread
     // (ensureTally via source_activate/deactivate/show/hide), and sendRaw can block up to its budget
     // on a half-dead peer; blocking there freezes the compositor on scene switches. The worker thread
-    // drains this (drainOutgoing) between polls. Tally/mode are self-healing (re-asserted ~1 Hz and on
-    // reconnect), so a deferred or teardown-dropped cue is harmless. Bounded to avoid unbounded growth.
+    // drains this (drainOutgoing) between polls.
+    //
+    // Nothing is kept for a phone that is not here: a queue filled while it was away was flushed
+    // into it on the next connect - cues of scene changes long past, settings nobody meant any
+    // more, sometimes to a different phone. The connect sends the current cue (first state snapshot).
+    if (!connected_.load())
+        return false;
     std::lock_guard<std::mutex> lk(outMutex_);
     if (outControl_.size() >= 64)
         outControl_.erase(outControl_.begin()); // drop oldest — newest cue supersedes it anyway
@@ -603,8 +746,8 @@ void AirliveConnection::drainOutgoing() {
     }
     for (const auto &json : pending)
         // Stop on the first failure: a false means the peer is gone/wedged, and each further sendRaw
-        // could burn its full send budget too — draining 64 of them would stall the worker (and delay
-        // the stall reaper) for many seconds. Control is self-healing, so dropping the rest is safe.
+        // could burn its full send budget too — draining 64 of them would stall the worker for many
+        // seconds. The rest is dropped with the connection; the next connect sends the current cue.
         if (!sendRaw(PacketType::Control, reinterpret_cast<const uint8_t *>(json.data()), json.size()))
             break;
 }

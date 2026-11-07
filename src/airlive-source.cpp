@@ -2,17 +2,20 @@
 //
 // One source == one advertised Bonjour instance == one iPhone slot. This file
 // owns the OBS-facing surface: registration, properties, the AVFrame ->
-// obs_source_frame2 bridge, a fixed presentation-delay buffer, connection
+// obs_source_frame2 bridge, the fixed playout delay (playout-clock.hpp), connection
 // status display, and Studio-Mode tally (setCue) back to the iPhone.
 //
 // Threading:
-//   - connection worker thread  -> decodes, runs the delay FIFO, does the pixel
-//                                   mapping + obs_source_output_video2();
-//                                   parses control JSON, calls onControl()
+//   - connection worker thread  -> decodes, schedules each frame (PlayoutClock) into
+//                                   the playout queue; parses control JSON, calls
+//                                   onControl()
+//   - OBS video thread          -> source_video_tick takes the frame whose time has
+//                                   come, does the pixel mapping + output_video2
 //   - OBS core thread           -> activate/deactivate/show/hide (tally),
 //                                   properties, create/update/destroy
-// Decode → delay → output are all synchronous on the worker thread, so the FIFO
-// and the per-source sws context have a single owner — no locks needed.
+// The queue is the only thing the two share (playoutMutex). The retired Bridge source
+// has no delay and outputs straight from the worker, so each source's pixel-mapping
+// buffers still have a single owner.
 
 #include <atomic>
 #include <chrono>
@@ -41,6 +44,7 @@ extern "C" {
 
 #include "airlive-connection.hpp"
 #include "delay-ladder.hpp"
+#include "playout-clock.hpp"
 #include "secret-store.hpp"
 
 OBS_DECLARE_MODULE()
@@ -91,12 +95,11 @@ constexpr const char *kCamColorSpace = "cam_colorspace"; // -> setColorSpace (st
 constexpr const char *kCamStab = "cam_stab";         // -> setStabilization (stringValue) — caps.stabilizations
 constexpr const char *kCamLutName = "cam_lut_name";  // -> setLUT (lutName; "" = clear) — caps.availableLuts
 
-constexpr size_t kSafetyCapFrames = 600; // anti-runaway if timestamps stop advancing
-
-// No decoded frame for this long ⇒ paint black. The on-air source lost signal, dropped, or the
-// Bridge deliberately cut its program to black (it just stops forwarding). Long enough to ride out
-// a single dropped frame / keyframe gap at 30 fps, short enough to feel like a deliberate cut.
-constexpr int64_t kNoSignalBlackNs = 600'000'000; // 600 ms
+// No decoded frame for this long ⇒ paint black: the camera lost its route (it goes completely
+// silent and resumes on the same connection) or the stream stopped. 1.5 s, the same threshold as
+// the Airlive Bridge: until then OBS holds the last picture, which rides out Wi-Fi hiccups and a
+// 5x lens switch (up to ~1.2 s without a frame); past it, black says plainly that nothing is coming.
+constexpr int64_t kNoSignalBlackNs = 1'500'000'000; // 1.5 s
 
 // Monotonic wall-clock in ns — for stall detection only (NOT frame timestamps, which stay on the
 // capture PTS timeline). steady_clock never jumps backwards on an NTP step.
@@ -106,11 +109,15 @@ inline int64_t nowMonoNs() {
         .count();
 }
 
-// A decoded frame held in the delay FIFO — an FFmpeg ref-counted clone (cheap,
-// refs the buffer, no pixel copy) tagged with its capture PTS.
+// The monotonic clock in seconds, for the playout schedule (same clock as nowMonoNs).
+inline double nowMonoSeconds() { return double(nowMonoNs()) / 1e9; }
+
+// A decoded frame waiting for its playout time — an FFmpeg ref-counted clone (cheap,
+// refs the buffer, no pixel copy).
 struct QueuedFrame {
     AVFrame *frame;
     int64_t pts_us;
+    double playout; // nowMonoSeconds() moment it plays
 };
 
 // One OBS source instance.
@@ -140,18 +147,17 @@ struct AirliveSourceCtx {
     std::vector<std::string> rCaps; // camera's advertised feature caps — future gating + matrix C1
 
     std::atomic<int> delayMs{kDefaultDelayMs};
-    std::atomic<bool> delayReset{false}; // set by source_update when delay changes
 
-    // Fixed-delay FIFO — mirrors OBS's own async-delay-filter: keep `delay`
-    // worth of frames (measured by their timestamps) and emit the oldest, so the
-    // output is always `delay` behind reality. Touched ONLY on the worker
-    // thread — decode → emit are synchronous there, so no locks/extra thread.
-    std::deque<QueuedFrame> dq;
-    bool delayReached = false;  // false while the buffer is still filling
-    int64_t lastQueuedPts = 0;  // for timestamp-jump detection
+    // Fixed playout delay (playout-clock.hpp): `clock` schedules on the worker thread, the frames
+    // wait in `playoutQueue` (ascending by playout) and source_video_tick releases them.
+    PlayoutClock clock{[this](const std::string &line) {
+        blog(LOG_INFO, "[airlive] %s", line.c_str());
+    }};
+    std::mutex playoutMutex;
+    std::deque<QueuedFrame> playoutQueue;
 
     // sws fallback — only used when the decoded format isn't one OBS takes
-    // directly. Touched ONLY on the worker thread.
+    // directly. Touched only by whichever thread outputs this source's frames.
     SwsContext *sws = nullptr;
     std::vector<uint8_t> swsBuf;
     int swsW = 0, swsH = 0;
@@ -160,7 +166,7 @@ struct AirliveSourceCtx {
     // Output rotation (clockwise degrees: 0/90/180/270) from the iPhone's
     // StateSnapshot.outputRotation. Presentation-only: 90/270 swap W/H (portrait).
     std::atomic<int> rotationDeg{0};
-    std::vector<uint8_t> rotBuf;   // rotated I420 output (worker thread only)
+    std::vector<uint8_t> rotBuf;   // rotated I420 output (same owner as the sws fallback)
     std::vector<uint8_t> i420Buf;  // sws→I420 staging for non-420p input
     SwsContext *swsRot = nullptr;  // converts a non-420p frame to I420 before rotating
     int swsRotW = 0, swsRotH = 0, swsRotFmt = -1;
@@ -209,7 +215,7 @@ struct AirliveSourceCtx {
     std::vector<std::string> capStabilizations; // "Standard"/"High"
     std::vector<std::string> capAvailableLuts; // phone's quick-access LUT names
     bool capsReceived = false; // a StateSnapshot.capabilities object has arrived (vs. the defaults)
-    // Set by the "Refresh" button (UI thread); consumed by onControl (worker thread) to issue the
+    // Set by the "Refresh" button (UI thread); consumed by source_video_tick (video thread) to issue the
     // actual obs_source_update_properties() — a property callback can't reload inline without UAF.
     std::atomic<bool> refreshRequested{false};
 
@@ -243,6 +249,12 @@ struct AirliveSourceCtx {
     // Tally state — guarded because OBS fires the callbacks on its own thread.
     std::mutex tallyMutex;
     std::string lastCue{"none"};
+    // The camera's own Tally switch (state snapshot `tallyEnabled`, absent = on). Off → no cue is
+    // sent; turning it back on gets the current one at once. Guarded by tallyMutex.
+    bool tallyEnabled = true;
+    // This connection's first state snapshot has arrived (reset on disconnect). It is the moment the
+    // phone is ready to hear its cue, so the cue is sent once there. Worker thread only.
+    bool stateSeen = false;
 
     ~AirliveSourceCtx() {
         if (sws)
@@ -438,7 +450,8 @@ void outputRotated(AirliveSourceCtx *ctx, const AVFrame *f, int64_t pts_us, int 
     ctx->lastEmittedTsNs.store(frame.timestamp); // keep any black frame on this same timeline
 }
 
-// Map a decoded AVFrame and hand it to OBS. Runs on the worker thread only.
+// Map a decoded AVFrame and hand it to OBS. One thread per source: the video thread for a camera
+// (source_video_tick), the worker for the retired Bridge source.
 void outputFrame(AirliveSourceCtx *ctx, const AVFrame *f, int64_t pts_us) {
     if (const int rot = normalizeRotation(ctx->rotationDeg.load())) {
         outputRotated(ctx, f, pts_us, rot); // clockwise presentation rotation (matches Studio)
@@ -510,27 +523,17 @@ void outputFrame(AirliveSourceCtx *ctx, const AVFrame *f, int64_t pts_us) {
     ctx->lastEmittedTsNs.store(frame.timestamp); // keep any black frame on this same timeline
 }
 
-// ---- fixed-delay FIFO ------------------------------------------------------
+// ---- fixed playout delay ----------------------------------------------------
 
-void flushDelayQueue(AirliveSourceCtx *ctx) {
-    for (auto &q : ctx->dq)
+void clearPlayoutQueue(AirliveSourceCtx *ctx) {
+    std::lock_guard<std::mutex> lk(ctx->playoutMutex);
+    for (auto &q : ctx->playoutQueue)
         av_frame_free(&q.frame);
-    ctx->dq.clear();
-    ctx->delayReached = false;
+    ctx->playoutQueue.clear();
 }
 
-// A discontinuity in capture timestamps (stream restart, big gap) makes the
-// buffered span meaningless — flush and refill on one.
-bool isTimestampJump(int64_t ts, int64_t prev) {
-    return ts < prev || (ts - prev) > 1000000; // backwards, or >1 s gap (µs)
-}
-
-// Per decoded frame, on the connection worker thread. Same timestamp-interval
-// delay as OBS's async-delay-filter: buffer frames until the span
-// (newest.pts - oldest.pts) reaches the delay, then emit the oldest for each new
-// frame — steady state is one-in/one-out, always `delay` behind reality.
-// (The previous wall-clock hold added no visible latency: OBS plays async frames
-//  by their timestamp cadence, so a constant per-frame hold is invisible on air.)
+// Per decoded frame, on the connection worker thread: schedule it. Nothing is output here, so
+// network jitter becomes time spent in the queue, never on-screen lag.
 void onDecodedFrame(AirliveSourceCtx *ctx, const AVFrame *f, int64_t pts_us) {
     // Report the OUTPUT dimensions (swapped for 90/270) so OBS sizes the source
     // to the rotated, portrait frame.
@@ -545,58 +548,58 @@ void onDecodedFrame(AirliveSourceCtx *ctx, const AVFrame *f, int64_t pts_us) {
     }
     ctx->lastPtsUs = pts_us;
 
-    // Delay changed (re-converge to new target) or timestamps jumped → refill.
-    if (ctx->delayReset.exchange(false) || isTimestampJump(pts_us, ctx->lastQueuedPts))
-        flushDelayQueue(ctx);
-    ctx->lastQueuedPts = pts_us;
+    // The retired Bridge source: the Bridge already timed the program, it flies straight through.
+    if (ctx->role == "obs-bridge") {
+        outputFrame(ctx, f, pts_us);
+        return;
+    }
 
-    const int64_t intervalUs = int64_t(ctx->delayMs.load()) * 1000;
+    bool dropQueued = ctx->clock.setBuffer(double(ctx->delayMs.load()) / 1000.0);
+    const double playout = ctx->clock.playoutTime(double(pts_us) / 1e6, nowMonoSeconds(), dropQueued);
+    if (dropQueued)
+        clearPlayoutQueue(ctx); // queued under the old timeline: cleaner than re-timing them
 
     AVFrame *clone = av_frame_clone(f);
     if (!clone)
         return;
-    ctx->dq.push_back({clone, pts_us});
-
-    // Keep filling until we hold `delay` worth of timeline; then emit the oldest.
-    // delay 0 → span 0 >= 0 → emit immediately (one-in/one-out, no added latency).
-    const int64_t span = ctx->dq.back().pts_us - ctx->dq.front().pts_us;
-    if (!ctx->delayReached && span < intervalUs && ctx->dq.size() <= kSafetyCapFrames)
-        return; // still filling — nothing on air yet
-    ctx->delayReached = true;
-
-    // Re-converge after a FORWARD timestamp gap (a lens/format switch pauses the
-    // camera ~0.3-0.5 s; a network stall does the same). Such a gap inflates the
-    // buffered span far past the target, and emitting one-per-frame would carry
-    // that gap as several frames of EXTRA latency on EVERY switch ("при смене линзы
-    // каждый раз добавляется задержка"). Instead drop the stale head in one shot so
-    // latency snaps back to the target. The margin is wide enough that ordinary
-    // capture jitter never trips it in steady state. (Backward jumps / >1 s gaps are
-    // already flushed by isTimestampJump above.)
-    const int64_t reconvergeMarginUs = 250000; // 250 ms over the target
-    while (ctx->dq.size() > 1 &&
-           (ctx->dq.back().pts_us - ctx->dq.front().pts_us) > intervalUs + reconvergeMarginUs) {
-        av_frame_free(&ctx->dq.front().frame);
-        ctx->dq.pop_front();
+    std::lock_guard<std::mutex> lk(ctx->playoutMutex);
+    ctx->playoutQueue.push_back({clone, pts_us, playout});
+    while (ctx->playoutQueue.size() > ctx->clock.queueCapacity()) { // overrun: the oldest goes
+        av_frame_free(&ctx->playoutQueue.front().frame);
+        ctx->playoutQueue.pop_front();
     }
+}
 
-    QueuedFrame out = ctx->dq.front();
-    ctx->dq.pop_front();
-    outputFrame(ctx, out.frame, out.pts_us);
-    av_frame_free(&out.frame);
-
-    // Re-enter "filling" once the buffer falls below the target span — otherwise a forward gap that
-    // drains the queue (reconverge above, or a stall) leaves delayReached stuck true, so the FIFO
-    // emits one-in/one-out at ~0 depth and the operator's chosen jitter buffer silently collapses
-    // for the rest of the session. Resetting lets the next frames rebuild the delay-worth span.
-    if (ctx->dq.empty() ||
-        (ctx->dq.back().pts_us - ctx->dq.front().pts_us) < intervalUs)
-        ctx->delayReached = false;
+// On every OBS video tick: output the newest frame whose time has come; older due frames are
+// skipped, never played late. Driven by OBS's own frame clock, so there is no second clock to beat
+// against it: a frame output here is the one the next tick shows (obs_source_video_tick runs
+// async_tick first, and the source is unbuffered). Between frames the picture simply stays.
+void releaseDueFrame(AirliveSourceCtx *ctx) {
+    QueuedFrame due{nullptr, 0, 0};
+    {
+        const double now = nowMonoSeconds();
+        std::lock_guard<std::mutex> lk(ctx->playoutMutex);
+        while (!ctx->playoutQueue.empty() && ctx->playoutQueue.front().playout <= now) {
+            if (due.frame)
+                av_frame_free(&due.frame);
+            due = ctx->playoutQueue.front();
+            ctx->playoutQueue.pop_front();
+        }
+    }
+    if (!due.frame)
+        return;
+    outputFrame(ctx, due.frame, due.pts_us);
+    av_frame_free(&due.frame);
 }
 
 // ---- tally (Studio Mode -> setCue) ----------------------------------------
 
-// Send the current cue to the iPhone. force=true sends even if unchanged (used
-// when the phone (re)connects, so it learns it's already live).
+// Send the current cue to the iPhone. force=true sends even if unchanged.
+//
+// Cues go out ONLY on a real change, when the phone connects (its first state snapshot), when it
+// switches its own tally back on, and once when it comes back after going silent (its route
+// returned; it darkened its lamp meanwhile). Never in reply to every state snapshot: that kept a
+// cue going to the phone about once a second for nothing (the same rules as the Airlive Bridge).
 //
 // active → "program" (on air); else showing → "preview" (staged in Studio Mode);
 // else "none". The cue is a closed set of literals, so building the JSON by
@@ -615,8 +618,10 @@ void ensureTally(AirliveSourceCtx *ctx, bool force) {
     bool valueChanged, needSend;
     {
         std::lock_guard<std::mutex> lk(ctx->tallyMutex);
+        if (!ctx->tallyEnabled)
+            return; // the camera refuses tally; the cue follows when it is switched back on
         valueChanged = (cue != ctx->lastCue);
-        needSend = force || valueChanged; // force re-asserts on (re)connect
+        needSend = force || valueChanged;
     }
     if (!needSend)
         return;
@@ -629,9 +634,9 @@ void ensureTally(AirliveSourceCtx *ctx, bool force) {
         std::lock_guard<std::mutex> lk(ctx->tallyMutex);
         ctx->lastCue = cue;
     }
-    // Log only real transitions / drops — never the ~1 Hz force re-asserts.
+    // A cue is refused only when no phone is connected; the connect sends the current one.
     if (valueChanged || !ok)
-        blog(LOG_INFO, "[airlive] tally -> %s%s", cue, ok ? "" : " (DROPPED, will retry)");
+        blog(LOG_INFO, "[airlive] tally -> %s%s", cue, ok ? (force ? " (re-sent)" : "") : " (not sent: no camera)");
 }
 
 // ---- control channel (status) ---------------------------------------------
@@ -736,19 +741,11 @@ void onControl(AirliveSourceCtx *ctx, const char *json, size_t len) {
     }
 
     bool gotState = false;
+    bool stateTallyEnabled = true;
     if (obs_data_t *st = obs_data_get_obj(msg, "state")) {
         std::string capsLog; // built under the lock, emitted after release (no I/O under stateMutex)
-        bool discreteChanged = false; // lens/fps/auto/first-caps changed → push a live dialog reload
         {
             std::lock_guard<std::mutex> lk(ctx->stateMutex);
-            const std::string oRLens = ctx->rLens;
-            const int oRFps = ctx->rFps;
-            const bool oRAE = ctx->rAE, oRAWB = ctx->rAWB;
-            // Old discrete format states — a change pushes a live dialog reload (below) so the seeded
-            // pickers refresh, exactly like lens/fps.
-            const std::string oRRes = ctx->rResolution, oRCS = ctx->rColorSpace, oRStab = ctx->rStabilization;
-            const std::string oRLutName = ctx->rLutName;
-            const bool oRLutEnabled = ctx->rLutEnabled;
             ctx->rDevice = obs_data_get_string(st, "deviceModel");
             ctx->rResolution = obs_data_get_string(st, "resolution");
             ctx->rColorSpace = obs_data_get_string(st, "colorSpace");
@@ -767,7 +764,6 @@ void onControl(AirliveSourceCtx *ctx, const char *json, size_t len) {
             ctx->rLutEnabled = obs_data_get_bool(st, "lutEnabled");
             // Device-read capability RANGES (additive object).  `has_user_value` guards each so a
             // missing key keeps the default (and so tint's negative min isn't clobbered to 0).
-            const bool oCapsReceived = ctx->capsReceived;
             const double oIsoMax = ctx->capIsoMax;
             const size_t oLensN = ctx->capLenses.size(), oFpsN = ctx->capFps.size();
             if (obs_data_t *caps = obs_data_get_obj(st, "capabilities")) {
@@ -820,38 +816,36 @@ void onControl(AirliveSourceCtx *ctx, const char *json, size_t len) {
                          ctx->capFps.size());
                 capsLog = buf;
             }
-            // Only a DISCRETE change pushes a live dialog reload (below). iso/shutter/wb drift
-            // continuously under auto-exposure — reloading on those would rebuild the dialog ~1 Hz
-            // and fight an operator mid-edit. A first capabilities arrival also counts (ranges show).
-            discreteChanged = (ctx->rLens != oRLens) || (ctx->rFps != oRFps) ||
-                              (ctx->rAE != oRAE) || (ctx->rAWB != oRAWB) ||
-                              (ctx->rResolution != oRRes) || (ctx->rColorSpace != oRCS) ||
-                              (ctx->rStabilization != oRStab) || (ctx->rLutName != oRLutName) ||
-                              (ctx->rLutEnabled != oRLutEnabled) ||
-                              (!oCapsReceived && ctx->capsReceived);
         }
         if (!capsLog.empty())
             blog(LOG_INFO, "%s", capsLog.c_str());
-        // Make the OPEN Properties dialog (if any) re-run get_properties so the status text, the
-        // capability ranges and the control-widget reseed reflect the new state. MUST come from this
-        // worker thread, NOT a property callback: from the UI thread the signal handler re-enters and
-        // frees the live widgets mid-callback (UAF). Off-thread the frontend queues the reload safely.
-        // No-op when no dialog is open. Also serves the manual "Refresh" button (sets refreshRequested).
-        // `alive` gate: never poke the UI once teardown started (see the crash note in video_tick).
-        if (ctx->alive.load() && (discreteChanged || ctx->refreshRequested.exchange(false)))
-            obs_source_update_properties(ctx->source);
+        // The open Properties dialog is NOT reloaded from here. An automatic reload can land while
+        // OBS shows a modal and crash it on macOS 26 (see the CRASH note in source_video_tick); the
+        // dialog picks up this state when it is opened or on its Refresh button.
         // Additive presentation rotation (clockwise; absent/0 = landscape).
         ctx->rotationDeg.store(normalizeRotation(int(obs_data_get_int(st, "outputRotation"))));
+        // Absent on older cameras: tally is then always allowed.
+        stateTallyEnabled = !obs_data_has_user_value(st, "tallyEnabled") || obs_data_get_bool(st, "tallyEnabled");
         obs_data_release(st);
         gotState = true;
     }
     obs_data_release(msg);
 
-    // Re-assert tally only on an actual state snapshot (the phone announcing
-    // itself), not on any other type-2 message — otherwise we'd emit a
-    // redundant setCue for messages that aren't a connect/state event.
-    if (gotState)
-        ensureTally(ctx, /*force=*/true);
+    // The phone's first state snapshot on a connection is when it is ready for its cue; a camera
+    // that switches its own tally back on gets the current cue at once. Nothing else here sends one.
+    if (gotState) {
+        bool sendNow;
+        {
+            std::lock_guard<std::mutex> lk(ctx->tallyMutex);
+            const bool firstState = !ctx->stateSeen;
+            const bool reEnabled = !ctx->tallyEnabled && stateTallyEnabled;
+            ctx->stateSeen = true;
+            ctx->tallyEnabled = stateTallyEnabled;
+            sendNow = firstState || reEnabled;
+        }
+        if (sendNow)
+            ensureTally(ctx, /*force=*/true);
+    }
 }
 
 // The live camera disconnected — reset the hello epoch so the NEXT connection is read fresh.
@@ -859,6 +853,15 @@ void onControl(AirliveSourceCtx *ctx, const char *json, size_t len) {
 // misread against the previous peer's proto/caps; PROTOCOL-COMPAT-SPEC §B requires a per-epoch
 // reset. Runs on the worker thread; guarded like the other r* fields.
 void onDisconnect(AirliveSourceCtx *ctx) {
+    ctx->clock.reset(); // the next phone starts a new timeline; its clock is not this one's
+    clearPlayoutQueue(ctx);
+    {
+        // The next connection starts over: its first state snapshot gets the cue again, and the
+        // tally switch is the new phone's to report.
+        std::lock_guard<std::mutex> tk(ctx->tallyMutex);
+        ctx->stateSeen = false;
+        ctx->tallyEnabled = true;
+    }
     std::lock_guard<std::mutex> lk(ctx->stateMutex);
     ctx->rProto = 0;
     ctx->rMinProto = 0;
@@ -877,6 +880,13 @@ void onDisconnect(AirliveSourceCtx *ctx) {
     ctx->capZoomMax = 0;
     ctx->capEvBiasMin = -2;
     ctx->capEvBiasMax = 2;
+}
+
+// The camera went silent (its route was lost) and speaks again on the SAME connection. It darkened
+// its lamp while it was cut off and waits for a cue, so it gets exactly one: the current one.
+// Worker thread.
+void onLinkResumed(AirliveSourceCtx *ctx) {
+    ensureTally(ctx, /*force=*/true);
 }
 
 // ---- camera control (Phase 2a — send set-commands) ------------------------
@@ -1065,7 +1075,14 @@ void rebuildConnection(AirliveSourceCtx *ctx) {
         makeIdentity(ctx),
         [self](const AVFrame *f, int64_t pts) { onDecodedFrame(self, f, pts); },
         [self](const char *j, size_t n) { onControl(self, j, n); },
-        [self]() { onDisconnect(self); });
+        [self]() { onDisconnect(self); },
+        [self]() { onLinkResumed(self); },
+        AirliveConnection::ResumeGate{
+            [self]() { self->clock.beginResume(nowMonoSeconds()); },
+            [self](int64_t pts_us, bool isKeyframe) {
+                return self->clock.resumeSample(double(pts_us) / 1e6, nowMonoSeconds(), isKeyframe) ==
+                       ResumeVerdict::Show;
+            }});
     std::lock_guard<std::mutex> lk(ctx->connMutex);
     ctx->conn = std::move(fresh);
     ctx->conn->start(); // start only SPAWNS the worker (never waits on it) — safe under the lock
@@ -1156,26 +1173,15 @@ void apply_settings(AirliveSourceCtx *ctx, obs_data_t *settings) {
     // so it flies straight through (no operator delay control on that source, see get_properties).
     int delay = (ctx->role == "obs-bridge") ? 0 : int(obs_data_get_int(settings, kSettingDelayMs));
     delay = delay < 0 ? 0 : (delay > kMaxDelayMs ? kMaxDelayMs : snapDelayToPreset(delay));
-    if (delay != ctx->delayMs.exchange(delay))
-        ctx->delayReset.store(true); // re-converge the FIFO to the new target
+    ctx->delayMs.store(delay); // the worker applies it on the next frame (PlayoutClock::setBuffer)
 
-    // WHO PACES PLAYOUT. Two different things got conflated here before: the
-    // milliseconds of delay (ours) and the SMOOTHING of an uneven arrival rate
-    // (libobs's). We used to force unbuffered ALWAYS, which threw away the second
-    // one — and our delay FIFO does not replace it: in steady state it is strictly
-    // one-in / one-out, so it shifts frames later without evening out their rhythm.
-    // Unbuffered means libobs drains to the NEWEST frame every composite tick, so
-    // network jitter lands straight on air as judder that reads as a low frame rate
-    // even while a full 30 fps arrives. (Screen Mirroring never disabled it, which
-    // is why it looked smooth on the same machine where this stuttered.)
-    //
-    //   Unbuffered (+0 ms) -> unbuffered: no added latency, exactly as labelled.
-    //   any other preset   -> buffered:   libobs plays frames on their timestamps,
-    //                                     which IS the jitter buffer the operator asked for.
-    //   Bridge program     -> buffered:   its delay is applied upstream in the Bridge
-    //                                     app, but the frames still reached the Bridge
-    //                                     over Wi-Fi, so this last hop still needs pacing.
-    obs_source_set_async_unbuffered(ctx->source, ctx->role != "obs-bridge" && delay == 0);
+    // WHO PACES PLAYOUT: this plugin, for a camera. libobs's buffered playout cannot hold a delay:
+    // its clock stops whenever its queue is empty, so every gap in the frames (a lens switch, a
+    // Wi-Fi dip) was added to the delay for good. The camera source is therefore unbuffered - libobs
+    // shows what it is given - and PlayoutClock + source_video_tick give it each frame on schedule,
+    // on OBS's own tick, so the rhythm is even whatever the network did.
+    // The retired Bridge source outputs on arrival, so that last hop keeps libobs's pacing.
+    obs_source_set_async_unbuffered(ctx->source, ctx->role != "obs-bridge");
 
     // The sid must survive restarts. Generate once and write it back into the
     // source's settings so it's saved with the scene collection.
@@ -1217,8 +1223,8 @@ void *source_create_bridge(obs_data_t *settings, obs_source_t *source) {
 void source_destroy(void *data) {
     auto *ctx = static_cast<AirliveSourceCtx *>(data);
     ctx->alive.store(false); // stop any UI poke from a still-draining callback (crash guard)
-    teardownConnection(ctx); // joins worker (lock released) — nothing touches the FIFO after this
-    flushDelayQueue(ctx); // free any frames still buffered
+    teardownConnection(ctx); // joins worker (lock released) — nothing fills the queue after this
+    clearPlayoutQueue(ctx); // free any frames still waiting
     delete ctx;
 }
 
@@ -1382,8 +1388,8 @@ bool cam_auto_modified(obs_properties_t *props, obs_property_t *, obs_data_t *se
 
 bool refresh_clicked(obs_properties_t *, obs_property_t *, void *data) {
     // A property callback runs on the UI thread, where obs_source_update_properties() would
-    // re-enter and free these very widgets mid-callback (UAF). So flag it instead: the connection
-    // worker (onControl) issues the real reload on the next state message (≤1 s while connected).
+    // re-enter and free these very widgets mid-callback (UAF). So flag it instead: the next video
+    // tick (source_video_tick) issues the real reload, connected or not.
     if (auto *ctx = static_cast<AirliveSourceCtx *>(data))
         ctx->refreshRequested.store(true);
     return true; // also re-render the existing widgets immediately (harmless)
@@ -1736,7 +1742,8 @@ void emitBlack(AirliveSourceCtx *ctx, uint32_t w, uint32_t h) {
     obs_source_output_video2(ctx->source, &frame);
 }
 
-// Runs every OBS video frame (video thread, NOT the UI thread). Two jobs:
+// Runs every OBS video frame (video thread, NOT the UI thread). Three jobs:
+//  0. Playout — output the frame whose time has come (releaseDueFrame).
 //  1. Live status — reload an OPEN Properties dialog when the connection flips (Waiting↔Receiving)
 //     or on an explicit Refresh. For the Bridge source this is the ONLY status driver: it sends no
 //     state messages, so onControl (the camera source's reload path) never fires. Safe off the UI
@@ -1756,6 +1763,8 @@ void source_video_tick(void *data, float /*seconds*/) {
     // on removing the Bridge source. The status text still refreshes on panel-open and on Refresh.
     if (ctx->refreshRequested.exchange(false))
         obs_source_update_properties(ctx->source);
+
+    releaseDueFrame(ctx); // before the no-signal check: a frame released now is not a stall
 
     const uint32_t w = ctx->statW.load(), h = ctx->statH.load();
     if (!w || !h)
@@ -1801,10 +1810,18 @@ struct obs_source_info makeSourceInfo(const char *id,
 struct obs_source_info airlive_source_info =
     makeSourceInfo("airlive_obs_source", source_get_name, source_create);
 
-// "OBS Airlive Bridge" — receives the Airlive Bridge program (role "obs-bridge"),
-// runs alongside the direct source without slot conflict.
-struct obs_source_info airlive_bridge_source_info =
-    makeSourceInfo("airlive_obs_bridge_source", source_get_name_bridge, source_create_bridge);
+// "OBS Airlive Bridge" — the RETIRED program link from the Airlive Bridge app, which reaches OBS
+// through its virtual camera now. Registered as OBSOLETE (= OBS_SOURCE_CAP_DISABLED), OBS's own way
+// to retire a source type - it does the same for the old versions of its own sources: the Add
+// Source dialog skips it, so nobody new adds it, while a scene that already holds one still loads
+// it (its Properties say what to use instead) rather than showing a missing plugin.
+// (OBS_SOURCE_DEPRECATED does NOT hide it: the dialog still lists it, marked deprecated.)
+struct obs_source_info airlive_bridge_source_info = [] {
+    struct obs_source_info info =
+        makeSourceInfo("airlive_obs_bridge_source", source_get_name_bridge, source_create_bridge);
+    info.output_flags |= OBS_SOURCE_CAP_OBSOLETE;
+    return info;
+}();
 
 } // namespace
 
@@ -1823,7 +1840,7 @@ bool obs_module_load(void) {
 #endif
     obs_register_source(&airlive_source_info);
     obs_register_source(&airlive_bridge_source_info);
-    blog(LOG_INFO, "[airlive-obs] OBS Airlive + OBS Airlive Bridge loaded");
+    blog(LOG_INFO, "[airlive-obs] OBS Airlive loaded (OBS Airlive Bridge kept for existing scenes only)");
     return true;
 }
 

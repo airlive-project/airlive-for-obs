@@ -142,9 +142,10 @@ Each **Airlive Camera** source exposes:
   **High (200)**, **Safe (400)**. Every value is a real shipping standard rather than a round
   number: 0 is libobs unbuffered, 60 is under two frames at 30 fps, 120 is SRT's own default
   jitter buffer, 200 is the top of WebRTC's interactive band, 400 is its buffer-against-glitches
-  figure. Decoded frames wait in a queue and are released when the delay has elapsed; decode,
-  delay and output all run on the one connection worker thread, so there is nothing to lock and
-  nothing to contend with. Unbuffered is not zero delay, it is "show on decode".
+  figure. Each frame plays at capture time + the fastest network path + this delay, on OBS's own
+  video tick: the path is measured for 2 s and then held, so the delay stays what you set for the
+  whole show. Frames that miss their slot play at once and the delay comes back by itself; the
+  OBS log says when that happens (`network slower than the delay`). Unbuffered is not zero delay, it is "show as soon as it arrives".
 - **Device name / Source name** — the Bonjour `dev` (group header on the iPhone)
   and `src` (row label) labels.
 
