@@ -76,7 +76,7 @@ jobs:
           cmake -S . -B build/windows -G "Visual Studio 17 2022" -A x64 `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=$env:VCPKG_TRIPLET -DVCPKG_MANIFEST_MODE=OFF `
-            -DVCPKG_INSTALLED_DIR="$env:VCPKG_INSTALLATION_ROOT\installed" `
+            -DAIRLIVE_VCPKG_PREFIX="$env:VCPKG_INSTALLATION_ROOT/installed/$env:VCPKG_TRIPLET" `
             -DOBS_SOURCE_DIR="$env:OBS_SRC" -DOBS_IMPORT_LIB="$env:OBS_LIB"
           if ($LASTEXITCODE -ne 0) { throw "configure failed" }
           cmake --build build/windows --config Release

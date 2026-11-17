@@ -31,7 +31,10 @@ endif()
 
 # vcpkg's ffmpeg port ships FindFFMPEG.cmake in its share folder: FFMPEG_INCLUDE_DIRS and
 # FFMPEG_LIBRARIES, the static libraries together with the system libraries they need.
-list(APPEND CMAKE_MODULE_PATH "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/ffmpeg")
+set(AIRLIVE_VCPKG_PREFIX "" CACHE PATH "vcpkg's installed/<triplet> folder holding FFmpeg")
+file(TO_CMAKE_PATH "${AIRLIVE_VCPKG_PREFIX}" AIRLIVE_VCPKG_PREFIX)
+list(APPEND CMAKE_MODULE_PATH "${AIRLIVE_VCPKG_PREFIX}/share/ffmpeg")
+list(APPEND CMAKE_PREFIX_PATH "${AIRLIVE_VCPKG_PREFIX}")
 find_package(FFMPEG REQUIRED)
 
 file(GLOB AIRLIVE_SHARED_SOURCES CONFIGURE_DEPENDS src/*.cpp)
