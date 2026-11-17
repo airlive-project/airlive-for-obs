@@ -19,6 +19,7 @@ if ($exports.Count -lt 500) { throw "only $($exports.Count) exports read from $O
 
 $def = Join-Path $Out 'obs.def'
 @('LIBRARY obs', 'EXPORTS') + $exports | Set-Content -Encoding ascii $def
-& lib /nologo /def:$def /out:(Join-Path $Out 'obs.lib') /machine:x64
+$lib = Join-Path $Out 'obs.lib'
+& lib /nologo "/def:$def" "/out:$lib" /machine:x64
 if ($LASTEXITCODE -ne 0) { throw "lib.exe failed ($LASTEXITCODE)" }
 Write-Host "obs.lib: $($exports.Count) exports"

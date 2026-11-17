@@ -31,8 +31,10 @@ jobs:
         with:
           arch: x64
 
-      - name: Cache vcpkg binaries
-        uses: actions/cache@v4
+      # Restore and save are separate steps: FFmpeg takes ~20 min to build, and a plain cache step
+      # would only save it when the WHOLE job succeeds.
+      - name: Restore vcpkg binaries
+        uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}\vcpkg-cache
           key: vcpkg-${{ env.VCPKG_TRIPLET }}-ffmpeg-avcodec-swscale-v1   # no commas allowed in a cache key
@@ -45,6 +47,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install "$env:FFMPEG_PORT" --triplet $env:VCPKG_TRIPLET
           if ($LASTEXITCODE -ne 0) { throw "vcpkg failed" }
+
+      - name: Save vcpkg binaries
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}\vcpkg-cache
+          key: vcpkg-${{ env.VCPKG_TRIPLET }}-ffmpeg-avcodec-swscale-v1
 
       - name: OBS ${{ env.OBS_VERSION }} headers and obs.lib
         shell: pwsh
