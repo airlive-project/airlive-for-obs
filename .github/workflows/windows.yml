@@ -1,0 +1,112 @@
+# Windows build of the plugin: compiles against OBS 30.2.3, runs the tests, checks the module
+# depends on nothing but OBS and Windows itself, and packages the installer. The macOS build is
+# separate (scripts/macos/build-macos.sh) and does not run here.
+name: windows
+
+on:
+  push:
+    branches: [main, feature/windows]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'data/**'
+      - 'cmake/windows/**'
+      - 'scripts/windows/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/windows.yml'
+  workflow_dispatch:
+
+env:
+  OBS_VERSION: '30.2.3'          # the OLDEST OBS we support - never the newest
+  VCPKG_TRIPLET: x64-windows-static-md
+  FFMPEG_PORT: 'ffmpeg[core,avcodec,swscale]'
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\vcpkg-cache
+          key: vcpkg-${{ env.VCPKG_TRIPLET }}-${{ env.FFMPEG_PORT }}-v1
+
+      - name: FFmpeg (static, avcodec + swscale)
+        shell: pwsh
+        env:
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install "$env:FFMPEG_PORT" --triplet $env:VCPKG_TRIPLET
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg failed" }
+
+      - name: OBS ${{ env.OBS_VERSION }} headers and obs.lib
+        shell: pwsh
+        run: |
+          $deps = "$env:GITHUB_WORKSPACE\deps"
+          New-Item -ItemType Directory -Force -Path $deps | Out-Null
+          Invoke-WebRequest "https://github.com/obsproject/obs-studio/archive/refs/tags/$env:OBS_VERSION.zip" -OutFile "$deps\obs-src.zip"
+          Expand-Archive "$deps\obs-src.zip" -DestinationPath $deps
+          Invoke-WebRequest "https://github.com/obsproject/obs-studio/releases/download/$env:OBS_VERSION/OBS-Studio-$env:OBS_VERSION-Windows.zip" -OutFile "$deps\obs-bin.zip"
+          Expand-Archive "$deps\obs-bin.zip" -DestinationPath "$deps\obs-bin"
+          $dll = Get-ChildItem "$deps\obs-bin" -Recurse -Filter obs.dll | Select-Object -First 1
+          ./scripts/windows/make-obs-import-lib.ps1 -ObsDll $dll.FullName -Out "$deps\obs-lib"
+          "OBS_SRC=$deps\obs-studio-$env:OBS_VERSION" >> $env:GITHUB_ENV
+          "OBS_BIN=$($dll.DirectoryName)" >> $env:GITHUB_ENV
+          "OBS_LIB=$deps\obs-lib\obs.lib" >> $env:GITHUB_ENV
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake -S . -B build/windows -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=$env:VCPKG_TRIPLET `
+            -DOBS_SOURCE_DIR="$env:OBS_SRC" -DOBS_IMPORT_LIB="$env:OBS_LIB"
+          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
+          cmake --build build/windows --config Release
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+
+      - name: Tests (playout clock, delay ladder, password crypto on CNG)
+        shell: pwsh
+        run: |
+          $t = "build\windows\tests"; New-Item -ItemType Directory -Force -Path $t | Out-Null
+          cl /nologo /std:c++17 /EHsc /Isrc tests\playout-clock-kat.cpp /Fe:$t\clock.exe /Fo:$t\
+          & "$t\clock.exe"; if ($LASTEXITCODE -ne 0) { throw "playout clock KAT failed" }
+          cl /nologo /std:c++17 /EHsc /Isrc tests\delay-ladder-kat.cpp /Fe:$t\ladder.exe /Fo:$t\
+          & "$t\ladder.exe"; if ($LASTEXITCODE -ne 0) { throw "delay ladder KAT failed" }
+          cl /nologo /std:c++17 /EHsc /DNOMINMAX /DWIN32_LEAN_AND_MEAN /Isrc "/I$env:OBS_SRC\libobs" /Icmake\windows `
+            tests\auth-kat.cpp src\platform\windows\crypto.cpp /Fe:$t\auth.exe /Fo:$t\ /link "$env:OBS_LIB" bcrypt.lib
+          $env:PATH = "$env:OBS_BIN;$env:PATH"   # obs.dll (logging) and its own dependencies
+          & "$t\auth.exe"; if ($LASTEXITCODE -ne 0) { throw "auth KAT failed" }
+
+      - name: The module depends only on OBS and Windows
+        shell: pwsh
+        run: |
+          $deps = & dumpbin /nologo /dependents build\windows\Release\airlive-obs.dll |
+            Where-Object { $_ -match '^\s+(\S+\.dll)\s*$' } | ForEach-Object { $Matches[1].ToLower() }
+          $deps | ForEach-Object { Write-Host "  $_" }
+          $foreign = $deps | Where-Object { $_ -notmatch '^(obs|kernel32|user32|advapi32|ws2_32|dnsapi|bcrypt|ole32|oleaut32|shell32|secur32|crypt32|mfplat|mfuuid|strmiids|vcruntime140(_1)?|msvcp140|api-ms-win-.*|ucrtbase)\.dll$' }
+          if ($foreign) { throw "unexpected runtime dependencies: $($foreign -join ', ')" }
+
+      - name: Installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y | Out-Null
+          $version = (Select-String -Path CMakeLists.txt -Pattern 'project\(airlive-obs VERSION ([0-9.]+)').Matches[0].Groups[1].Value
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" `
+            "/DBuildDir=$env:GITHUB_WORKSPACE\build\windows\Release" "/DRepoDir=$env:GITHUB_WORKSPACE" `
+            "/O$env:GITHUB_WORKSPACE\dist\windows" scripts\windows\installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "installer failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airlive-for-obs-windows
+          path: |
+            dist/windows/*.exe
+            build/windows/Release/airlive-obs.dll

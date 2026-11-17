@@ -284,33 +284,32 @@ void AirliveConnection::run() {
 #endif
         // Keepalive is what frees the slot from a peer that died without a FIN (silence alone no
         // longer closes: a camera with no route is silent and comes back on this same socket).
-        int ka = 1;
-        setsockopt(client, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char *>(&ka), sizeof(ka));
-        int idle = 10; // seconds idle before the first keepalive probe
+        set_int_option(client, SOL_SOCKET, SO_KEEPALIVE, 1);
+        constexpr int kKeepaliveIdleSeconds = 10; // idle before the first keepalive probe
 #if defined(TCP_KEEPALIVE)
-        setsockopt(client, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle)); // macOS/BSD
+        set_int_option(client, IPPROTO_TCP, TCP_KEEPALIVE, kKeepaliveIdleSeconds); // macOS, Windows
 #elif defined(TCP_KEEPIDLE)
-        setsockopt(client, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));  // Linux
+        set_int_option(client, IPPROTO_TCP, TCP_KEEPIDLE, kKeepaliveIdleSeconds);  // Linux
 #endif
         // 10 s idle + 3 probes 10 s apart ≈ 40 s, the Bridge's numbers: well inside a service, and
         // gentle on the phone's radio (probing every few seconds wakes it for nothing). A phone that
         // returns on a new socket never waits for this - it takes over (see serveClient).
-        int kaIntvl = 10, kaCnt = 3;
 #if defined(TCP_KEEPINTVL)
-        setsockopt(client, IPPROTO_TCP, TCP_KEEPINTVL, &kaIntvl, sizeof(kaIntvl));
+        set_int_option(client, IPPROTO_TCP, TCP_KEEPINTVL, 10);
 #endif
 #if defined(TCP_KEEPCNT)
-        setsockopt(client, IPPROTO_TCP, TCP_KEEPCNT, &kaCnt, sizeof(kaCnt));
+        set_int_option(client, IPPROTO_TCP, TCP_KEEPCNT, 3);
 #endif
         // Nagle OFF. Inbound camera->OBS video is one-way bulk (Nagle on the receiver never delays
         // it), but everything OBS SENDS BACK on this socket — the auth handshake + tally setCue cues
         // — is a lone small write that Nagle + delayed-ACK can sit on for ~40ms. Camera (noDelay=true)
         // and Bridge (tcp.noDelay=true) already disable it; make all three ends consistent.
-        int nodelay = 1;
-        setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+        set_int_option(client, IPPROTO_TCP, TCP_NODELAY, 1);
+        // Give up on data the peer never acknowledges (keepalive does not cover that case).
 #if defined(TCP_RXT_CONNDROPTIME)
-        int dropTime = kConnectionDropSeconds; // macOS: give up on data the peer never acknowledges
-        setsockopt(client, IPPROTO_TCP, TCP_RXT_CONNDROPTIME, &dropTime, sizeof(dropTime));
+        set_int_option(client, IPPROTO_TCP, TCP_RXT_CONNDROPTIME, kConnectionDropSeconds); // macOS
+#elif defined(TCP_MAXRT)
+        set_int_option(client, IPPROTO_TCP, TCP_MAXRT, kConnectionDropSeconds);            // Windows
 #endif
         {
             std::lock_guard<std::mutex> lk(sendMutex_);

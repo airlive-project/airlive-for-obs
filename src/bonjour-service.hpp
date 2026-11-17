@@ -8,9 +8,9 @@
 // The phone groups instances by `did` (header = `dev`), lists each `src`, and
 // flips our row to "In use" when busy=1.
 //
-// Implemented against dns_sd (Bonjour API): built in on macOS, provided by the
-// Bonjour SDK on Windows and by avahi-compat-libdns_sd on Linux — so one code
-// path covers all three.
+// One implementation per OS, each on the system's own mDNS responder so the user installs nothing:
+// platform/macos/bonjour-service.cpp (dns_sd) and platform/windows/bonjour-service.cpp (the
+// DnsService* API of Windows 10 1809 and later).
 
 #pragma once
 
@@ -49,16 +49,18 @@ public:
     void stop();
 
     // The dns_sd socket fd to poll, and the handler to call when it's readable —
-    // lets the owner service registration/conflict callbacks. -1 when inactive.
+    // lets the owner service registration/conflict callbacks. -1 when inactive, and always -1 on
+    // Windows, whose API calls back on its own thread.
     int fd() const;
     void process();
 
 private:
     bool publishTxt(bool busy);
 
-    void *ref_ = nullptr; // DNSServiceRef (opaque here; cast in the .cpp)
+    void *ref_ = nullptr; // the OS registration handle (opaque here; owned by the platform .cpp)
     ServiceIdentity id_;
     bool busy_ = false;
+    uint16_t port_ = 0; // kept for a re-registration (Windows has no in-place TXT update)
 };
 
 } // namespace airlive

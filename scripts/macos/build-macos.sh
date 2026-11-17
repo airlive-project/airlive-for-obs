@@ -2,13 +2,13 @@
 # build-macos.sh — compile, link, ad-hoc sign, and (optionally) install the
 # Airlive OBS plugin on macOS without CMake/Xcode.
 #
-#   ./scripts/build-macos.sh           # build only  → build/airlive-obs.plugin
-#   ./scripts/build-macos.sh install   # build + install into the user plugins dir
+#   ./scripts/macos/build-macos.sh           # build only  → build/macos/airlive-obs.plugin
+#   ./scripts/macos/build-macos.sh install   # build + install into the user plugins dir
 #
 # Header/lib locations are overridable via env (defaults below). libobs headers
 # come from an obsproject/obs-studio checkout; simde is a submodule of that repo.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 # ⚠️ Build against the OLDEST OBS we support — NEVER the newest.  The headers bake
 # LIBOBS_API_VER into obs_module_ver(), and OBS REFUSES any module reporting a newer
@@ -33,12 +33,12 @@ MIN_MACOS="${MIN_MACOS:-13.0}"                  # deployment target — ≤ OBS'
 PLUGIN="airlive-obs"
 PLUGIN_VERSION="${PLUGIN_VERSION:-1.0}"
 
-BUILD="build"
+BUILD="build/macos"
 rm -rf "$BUILD"; mkdir -p "$BUILD/obj"
 
 echo "== compile =="
 objs=()
-for f in src/*.cpp; do
+for f in src/*.cpp src/platform/macos/*.cpp; do   # shared code + the macOS platform layer
   o="$BUILD/obj/$(basename "${f%.cpp}").o"
   clang++ -std=c++17 -O2 -arch arm64 -mmacosx-version-min="$MIN_MACOS" \
     -Isrc -I"$OBS_INC" -I"$SIMDE_INC" -I"$FFMPEG_INC" -c "$f" -o "$o"

@@ -1,68 +1,58 @@
-# airlive-obs — CMake build.
+# airlive-obs — the Windows build. (macOS builds with scripts/macos/build-macos.sh, which bundles
+# its own FFmpeg and signs/notarizes; this file is not used there.)
 #
-# Pragmatic, self-contained build that finds libobs and FFmpeg. It also works
-# when dropped into obsproject/obs-plugintemplate (which provides its own
-# helpers); in that case prefer the template's CMake and just add src/*.cpp.
+# What it needs, all fetched by .github/workflows/windows.yml (the steps there are the recipe):
+#   OBS_SOURCE_DIR   an obs-studio 30.2.3 source tree, for the libobs headers. Build against the
+#                    OLDEST OBS we support, never the newest: OBS refuses a module that reports a
+#                    newer libobs than its own (see scripts/macos/build-macos.sh).
+#   OBS_IMPORT_LIB   obs.lib, made from OBS 30.2.3's obs.dll (the plugin links obs.dll at runtime).
+#   FFmpeg           avcodec + swscale from vcpkg, STATIC (triplet x64-windows-static-md), so the
+#                    plugin carries its own decoder and never depends on which FFmpeg DLLs a given
+#                    OBS version ships.
 
-# Plugin binary is "airlive-obs" — kept distinct from any older Airlive
-# screen-mirroring plugin file already on the machine.
-cmake_minimum_required(VERSION 3.16)
-project(airlive-obs VERSION 1.0.0 LANGUAGES C CXX)
+cmake_minimum_required(VERSION 3.20)
+project(airlive-obs VERSION 1.4.0 LANGUAGES C CXX)
+
+if(NOT WIN32)
+  message(FATAL_ERROR "This CMake build is for Windows. On macOS run scripts/macos/build-macos.sh.")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# --- libobs ---------------------------------------------------------------
-# Provided by an OBS dev install (libobsConfig.cmake) or the plugin template.
-find_package(libobs REQUIRED)
-
-# --- FFmpeg (libavcodec / libavutil / libswscale) -------------------------
-# macOS/Linux ship pkg-config with their dev toolchains. Windows/MSVC does not,
-# so find_package(PkgConfig REQUIRED) hard-fails the configure step there. On
-# Windows, build inside obsproject/obs-plugintemplate (which vendors FFmpeg) or
-# provide FFmpeg via vcpkg (find_package(FFMPEG) below picks up its targets).
-if(NOT WIN32)
-  find_package(PkgConfig REQUIRED)
-  pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-    libavcodec
-    libavutil
-    libswscale)
-  set(AIRLIVE_FFMPEG_LIB PkgConfig::FFMPEG)
-else()
-  # vcpkg's ffmpeg port exposes a FFMPEG find module (FFMPEG_INCLUDE_DIRS /
-  # FFMPEG_LIBRARIES). Requires -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake.
-  find_package(FFMPEG REQUIRED)
-  add_library(airlive_ffmpeg INTERFACE)
-  target_include_directories(airlive_ffmpeg INTERFACE ${FFMPEG_INCLUDE_DIRS})
-  target_link_libraries(airlive_ffmpeg INTERFACE ${FFMPEG_LIBRARIES})
-  set(AIRLIVE_FFMPEG_LIB airlive_ffmpeg)
+set(OBS_SOURCE_DIR "" CACHE PATH "obs-studio 30.2.3 source tree (libobs headers)")
+set(OBS_IMPORT_LIB "" CACHE FILEPATH "obs.lib made from OBS 30.2.3's obs.dll")
+if(NOT EXISTS "${OBS_SOURCE_DIR}/libobs/obs-module.h")
+  message(FATAL_ERROR "OBS_SOURCE_DIR must point at an obs-studio 30.2.3 source tree")
+endif()
+if(NOT EXISTS "${OBS_IMPORT_LIB}")
+  message(FATAL_ERROR "OBS_IMPORT_LIB must point at obs.lib")
 endif()
 
-add_library(${PROJECT_NAME} MODULE
-  src/packet-parser.cpp
-  src/h264-decoder.cpp
-  src/bonjour-service.cpp
-  src/airlive-connection.cpp
-  src/airlive-source.cpp)
+find_package(FFMPEG REQUIRED) # vcpkg: FFMPEG_INCLUDE_DIRS / FFMPEG_LIBRARIES (with their system libs)
+
+file(GLOB AIRLIVE_SHARED_SOURCES CONFIGURE_DEPENDS src/*.cpp)
+file(GLOB AIRLIVE_WINDOWS_SOURCES CONFIGURE_DEPENDS src/platform/windows/*.cpp)
+add_library(${PROJECT_NAME} MODULE ${AIRLIVE_SHARED_SOURCES} ${AIRLIVE_WINDOWS_SOURCES})
+
+target_include_directories(${PROJECT_NAME} PRIVATE
+  src
+  "${OBS_SOURCE_DIR}/libobs"
+  cmake/windows            # obsconfig.h, which the libobs headers expect next to them
+  ${FFMPEG_INCLUDE_DIRS})
+
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+  NOMINMAX                 # windows.h must not turn std::min / std::max into macros
+  WIN32_LEAN_AND_MEAN
+  _CRT_SECURE_NO_WARNINGS)
+target_compile_options(${PROJECT_NAME} PRIVATE /utf-8 /permissive- /W3)
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
-  OBS::libobs
-  ${AIRLIVE_FFMPEG_LIB})
-
-# --- Bonjour / mDNS per platform ------------------------------------------
-if(APPLE)
-  # dns_sd is part of the system frameworks; no extra link needed.
-elseif(WIN32)
-  # Bonjour SDK for Windows: provides dns_sd.h + dnssd.lib.
-  target_link_libraries(${PROJECT_NAME} PRIVATE dnssd ws2_32)
-else() # Linux
-  # avahi-compat-libdns_sd exposes the same dns_sd.h API over Avahi.
-  pkg_check_modules(DNSSD REQUIRED IMPORTED_TARGET avahi-compat-libdns_sd)
-  target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::DNSSD)
-endif()
+  "${OBS_IMPORT_LIB}"
+  ${FFMPEG_LIBRARIES}
+  ws2_32                   # sockets
+  dnsapi                   # mDNS advert (DnsServiceRegister)
+  bcrypt                   # HMAC + random for the receiver password
+  advapi32)                # Credential Manager
 
 set_target_properties(${PROJECT_NAME} PROPERTIES PREFIX "")
-
-# Install rules differ per packaging target; the plugin template handles this.
-# For a manual install, copy the built module + data/ into your OBS plugins dir.

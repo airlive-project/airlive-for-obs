@@ -1,4 +1,7 @@
-#include "bonjour-service.hpp"
+// bonjour-service.cpp (macOS) — the advert through dns_sd, the system mDNSResponder. See
+// bonjour-service.hpp.
+
+#include "../../bonjour-service.hpp"
 
 #include <cstring>
 #include <string>
@@ -6,7 +9,7 @@
 #include <obs-module.h>
 #include <dns_sd.h>
 
-#include "wire.hpp" // kProtoGeneration / kProtoMinGeneration for the pv/mpv TXT keys
+#include "../../wire.hpp" // kProtoGeneration / kProtoMinGeneration for the pv/mpv TXT keys
 
 namespace airlive {
 

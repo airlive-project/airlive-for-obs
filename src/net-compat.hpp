@@ -5,6 +5,7 @@
 
 #ifdef _WIN32
 #include <winsock2.h>
+#include <mstcpip.h>
 #include <ws2tcpip.h>
 using socket_t = SOCKET;
 using poll_fd_t = WSAPOLLFD;
@@ -25,3 +26,10 @@ constexpr socket_t kInvalidSocket = -1;
 inline int close_socket(socket_t s) { return ::close(s); }
 inline int poll_sockets(poll_fd_t *f, unsigned long n, int t) { return ::poll(f, n, t); }
 #endif
+
+// setsockopt with an int value. Winsock declares the value as const char *, POSIX as const void *;
+// this keeps every call site the same on both.
+inline int set_int_option(socket_t s, int level, int name, int value) {
+    return ::setsockopt(s, level, name, reinterpret_cast<const char *>(&value), sizeof(value));
+}
+

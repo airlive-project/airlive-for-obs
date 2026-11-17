@@ -2,7 +2,7 @@
 //
 // Replicates AirliveCore's AirliveAuth (the FROZEN canonical definition) so the
 // camera, Studio, Bridge and this plugin all compute the SAME tag bit-for-bit —
-// see docs/STREAM-AUTH-SPEC.md.  Header-only so it needs no build-script change.
+// see docs/STREAM-AUTH-SPEC.md.  The HMAC and the nonce come from the OS (platform/crypto.hpp).
 //
 // THE tag (replicate EXACTLY): HMAC-SHA256(key = UTF-8 bytes of the password,
 // message = the 32 raw nonce bytes) → raw 32-byte tag.  No normalization, no KDF,
@@ -20,29 +20,10 @@
 #include <cstring>
 #include <string>
 
+#include "platform/crypto.hpp"
 #include "wire.hpp" // kAuthTagLength
 
-#if defined(__APPLE__)
-#include <CommonCrypto/CommonHMAC.h>
-#include <cstdlib> // arc4random_buf
-#else
-#include <openssl/hmac.h> // cross-platform port (Win/Linux) — not compiled on macOS
-#include <openssl/rand.h>
-#endif
-
 namespace airlive {
-
-// Compute HMAC-SHA256 into out[32].
-inline void hmacSha256(const uint8_t *key, size_t keyLen,
-                       const uint8_t *msg, size_t msgLen,
-                       uint8_t out[kAuthTagLength]) {
-#if defined(__APPLE__)
-    CCHmac(kCCHmacAlgSHA256, key, keyLen, msg, msgLen, out);
-#else
-    unsigned int len = kAuthTagLength;
-    HMAC(EVP_sha256(), key, int(keyLen), msg, msgLen, out, &len);
-#endif
-}
 
 // The canonical response tag for a (password, nonce) pair.
 inline void authResponseTag(const std::string &password,
@@ -76,11 +57,7 @@ inline bool authVerify(const std::string &password,
 
 // Fill a single-use challenge nonce from the system CSPRNG.
 inline void fillNonce(uint8_t out[kAuthTagLength]) {
-#if defined(__APPLE__)
-    arc4random_buf(out, kAuthTagLength);
-#else
-    RAND_bytes(out, kAuthTagLength);
-#endif
+    secureRandom(out, kAuthTagLength);
 }
 
 // Build the JSON for an AuthResult packet (receiver→camera).  snake_case reason

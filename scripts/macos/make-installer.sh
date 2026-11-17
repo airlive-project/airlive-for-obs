@@ -2,30 +2,30 @@
 # make-installer.sh — package the already-built "Airlive for OBS" plugin (the Airlive Camera
 # source) into a double-click .pkg for OBS Studio.
 #
-# Run AFTER scripts/build-macos.sh (which produces a self-contained, minos-restamped, signed
-# build/airlive-obs.plugin). This step only wraps that bundle in a pkg — no re-bundling.
+# Run AFTER scripts/macos/build-macos.sh (which produces a self-contained, minos-restamped, signed
+# build/macos/airlive-obs.plugin). This step only wraps that bundle in a pkg — no re-bundling.
 #
 # Signed release: set INSTALLER_ID="Developer ID Installer: … (TEAMID)" then notarize + staple
 # the pkg (see airlive-bridge/docs/APPLE-DEVELOPER-RELEASE.md). Unset → unsigned pkg (right-click → Open).
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 ROOT="$(pwd)"
 PRODUCT="Airlive for OBS"
 VERSION="${VERSION:-1.0.0}"
 PKG_ID="studio.airlive.obs.airlive-for-obs"
 BUNDLE_NAME="airlive-obs.plugin"
-SRC_PLUGIN="$ROOT/build/$BUNDLE_NAME"
+SRC_PLUGIN="$ROOT/build/macos/$BUNDLE_NAME"
 MIN_MACOS="${MIN_MACOS:-14.0}"; MIN_MACOS_MAJOR="${MIN_MACOS%%.*}"
 
-DIST="$ROOT/dist"
+DIST="$ROOT/dist/macos"
 PAYLOAD="$DIST/payload"
 SCRIPTS="$DIST/scripts"
 RESOURCES="$DIST/resources"
 INSTALL_DIR="Library/Application Support/obs-studio/plugins"
 PKG_OUT="$DIST/Airlive-for-OBS.pkg"
 
-[ -d "$SRC_PLUGIN" ] || { echo "✗ $SRC_PLUGIN not found — run scripts/build-macos.sh first" >&2; exit 1; }
+[ -d "$SRC_PLUGIN" ] || { echo "✗ $SRC_PLUGIN not found — run scripts/macos/build-macos.sh first" >&2; exit 1; }
 
 echo "==> Cleaning previous build"
 rm -rf "$DIST"; mkdir -p "$PAYLOAD/$INSTALL_DIR" "$SCRIPTS" "$RESOURCES"
@@ -128,7 +128,7 @@ else
 fi
 
 rm -rf "$PAYLOAD" "$SCRIPTS" "$RESOURCES" "$COMPONENT" "$DIST_XML"
-cp "$ROOT/scripts/uninstall.command" "$DIST/uninstall.command" 2>/dev/null && chmod +x "$DIST/uninstall.command" || true
+cp "$ROOT/scripts/macos/uninstall.command" "$DIST/uninstall.command" 2>/dev/null && chmod +x "$DIST/uninstall.command" || true
 
 echo ""
 echo "==> Done!  $PKG_OUT ($(du -h "$PKG_OUT" | cut -f1))"

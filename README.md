@@ -72,33 +72,41 @@ https://github.com/user-attachments/assets/e855d1e5-ffff-4490-a67b-6f993a7c8647
 | `src/wire.hpp` | Wire-format constants (magic, header size, limits, NAL types) |
 | `src/packet-parser.{hpp,cpp}` | Stateful 18-byte-header framing parser; resyncs on bad headers |
 | `src/h264-decoder.{hpp,cpp}` | FFmpeg H.264 decode; AVCC→Annex-B, SPS/PPS caching |
-| `src/bonjour-service.{hpp,cpp}` | `_airlive._tcp` advertise + TXT record (dns_sd) |
+| `src/bonjour-service.hpp` + `src/platform/<os>/bonjour-service.cpp` | `_airlive._tcp` advertise + TXT record |
+| `src/playout-clock.hpp` | The fixed playout delay (same rules as the Airlive Bridge) |
+| `src/secret-store.hpp`, `src/platform/crypto.hpp` + `src/platform/<os>/` | Receiver password: OS secret store, HMAC, random |
 | `src/net-compat.hpp` | POSIX/Winsock socket shim |
 | `src/airlive-connection.{hpp,cpp}` | Worker thread: listen → accept → parse → decode |
 | `src/airlive-source.cpp` | `obs_source_info`, properties, AVFrame→`obs_source_frame`, module entry |
 
+## Layout
+
+| Folder | What lives there |
+|---|---|
+| `src/` | Everything shared by every platform: protocol, connection, decoder, playout clock, OBS source |
+| `src/platform/macos/` | macOS only: mDNS advert (dns_sd), Keychain, CommonCrypto |
+| `src/platform/windows/` | Windows only: mDNS advert (DnsService API), Credential Manager, CNG |
+| `scripts/macos/` | macOS build, `.pkg` installer, uninstaller |
+| `scripts/windows/` | Windows installer (Inno Setup) and the obs.lib helper |
+| `cmake/windows/`, `CMakeLists.txt` | The Windows build |
+| `.github/workflows/windows.yml` | Builds, tests and packages Windows on every push |
+| `tests/` | Known-answer tests, run on both platforms |
+
+Build output goes to `build/macos/` and `build/windows/`, installers to `dist/macos/` and
+`dist/windows/` (all git-ignored). Both builds compile against **OBS 30.2.3**, the oldest OBS we
+support: OBS refuses a module that reports a newer libobs than its own.
+
 ## Build
 
-Requires the **OBS Studio dev files** (`libobs`) and **FFmpeg**
-(`libavcodec`/`libavutil`/`libswscale`), plus a Bonjour/mDNS backend.
+**macOS** - `scripts/macos/build-macos.sh` (add `install` to put it in your OBS), then
+`scripts/macos/make-installer.sh` for the `.pkg`. It bundles a low-deployment-target FFmpeg and
+signs with `SIGN_ID` / `INSTALLER_ID`; see the script headers.
 
-```bash
-cmake -B build -G Ninja
-cmake --build build
-```
-
-- **macOS** — dns_sd is built in. Install FFmpeg (`brew install ffmpeg`) and OBS
-  dev files.
-- **Linux** — `libavahi-compat-libdnssd-dev` provides the dns_sd API over Avahi.
-- **Windows** — install the Bonjour SDK (provides `dns_sd.h` + `dnssd.lib`).
-
-For a production multi-platform build with signing/packaging/CI, drop these
-`src/*.cpp` files into [obs-plugintemplate](https://github.com/obsproject/obs-plugintemplate)
-and use its CMake. The bundled `CMakeLists.txt` here is a pragmatic standalone
-build for local iteration.
-
-Copy the built module and `data/` into your OBS `plugins` directory, then add an
-**"Airlive Camera"** source in OBS.
+**Windows** - built by GitHub Actions (`.github/workflows/windows.yml`); download the installer
+from the run's artifacts. It needs Windows 10 1809 or later and installs into
+`%ProgramData%\obs-studio\plugins\airlive-obs`. FFmpeg is linked statically, so the plugin does
+not depend on the FFmpeg DLLs of any particular OBS version, and mDNS uses the advertising built
+into Windows - nothing else to install.
 
 ## Verified against OBS source
 
@@ -110,9 +118,8 @@ same `avcodec_alloc_context3`/`open2` init, plane pass-through (no copy),
 (the legacy v1 output path does not honour partial range, and H.264 is
 limited-range). The pixel-format mapping matches
 [`obs-ffmpeg-formats.h`](https://github.com/obsproject/obs-studio/blob/master/plugins/obs-ffmpeg/obs-ffmpeg-formats.h),
-and the CMake/module boilerplate matches
-[`obs-plugintemplate`](https://github.com/obsproject/obs-plugintemplate)
-(`find_package(libobs)` → `OBS::libobs`). The AVCC→Annex-B conversion is ours
+and the module boilerplate matches
+[`obs-plugintemplate`](https://github.com/obsproject/obs-plugintemplate). The AVCC→Annex-B conversion is ours
 because the Airlive wire is AVCC + separate SPS/PPS, whereas win-dshow's
 cameras already deliver Annex-B.
 
