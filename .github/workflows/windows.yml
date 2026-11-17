@@ -47,6 +47,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install "$env:FFMPEG_PORT" --triplet $env:VCPKG_TRIPLET
           if ($LASTEXITCODE -ne 0) { throw "vcpkg failed" }
+          Get-ChildItem "$env:VCPKG_INSTALLATION_ROOT\installed\$env:VCPKG_TRIPLET\share\ffmpeg" | ForEach-Object { "  $($_.Name)" }
 
       - name: Save vcpkg binaries
         uses: actions/cache/save@v4
@@ -74,7 +75,8 @@ jobs:
         run: |
           cmake -S . -B build/windows -G "Visual Studio 17 2022" -A x64 `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET=$env:VCPKG_TRIPLET `
+            -DVCPKG_TARGET_TRIPLET=$env:VCPKG_TRIPLET -DVCPKG_MANIFEST_MODE=OFF `
+            -DVCPKG_INSTALLED_DIR="$env:VCPKG_INSTALLATION_ROOT\installed" `
             -DOBS_SOURCE_DIR="$env:OBS_SRC" -DOBS_IMPORT_LIB="$env:OBS_LIB"
           if ($LASTEXITCODE -ne 0) { throw "configure failed" }
           cmake --build build/windows --config Release

@@ -29,7 +29,10 @@ if(NOT EXISTS "${OBS_IMPORT_LIB}")
   message(FATAL_ERROR "OBS_IMPORT_LIB must point at obs.lib")
 endif()
 
-find_package(FFMPEG REQUIRED) # vcpkg: FFMPEG_INCLUDE_DIRS / FFMPEG_LIBRARIES (with their system libs)
+# vcpkg's ffmpeg port ships FindFFMPEG.cmake in its share folder: FFMPEG_INCLUDE_DIRS and
+# FFMPEG_LIBRARIES, the static libraries together with the system libraries they need.
+list(APPEND CMAKE_MODULE_PATH "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/ffmpeg")
+find_package(FFMPEG REQUIRED)
 
 file(GLOB AIRLIVE_SHARED_SOURCES CONFIGURE_DEPENDS src/*.cpp)
 file(GLOB AIRLIVE_WINDOWS_SOURCES CONFIGURE_DEPENDS src/platform/windows/*.cpp)
